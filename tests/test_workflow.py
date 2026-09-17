@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
-from porschehunter import acceptance, comps, db, sheets, validate
-from porschehunter.sources import classic_com, marketcheck
+from porschehunter import acceptance, comps, db, http_util, sheets, validate
+from porschehunter.sources import classic_com, jsonld, marketcheck
 from test_core import TODAY, add_synthetic_comp, fresh_db
 from porschehunter.sources import manual
 
@@ -236,25 +237,152 @@ class TestClassicComAdapter(unittest.TestCase):
 
 
 class TestMarketCheckAdapter(unittest.TestCase):
+    """Endpoint paths are operator-confirmed against MarketCheck's docs.
+    The RESPONSE SCHEMA is not, so it is externalised and gated."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()) / "fields.json"
+        self._old_key = os.environ.get("MARKETCHECK_API_KEY")
+        os.environ.pop("MARKETCHECK_API_KEY", None)
+
+    def tearDown(self):
+        if self._old_key is None:
+            os.environ.pop("MARKETCHECK_API_KEY", None)
+        else:
+            os.environ["MARKETCHECK_API_KEY"] = self._old_key
+
     def test_documented_host(self):
         self.assertIn("api.marketcheck.com", marketcheck.BASE_URL)
 
-    def test_unconfirmed_endpoints_refuse_to_be_called(self):
-        for kind in ("private_party", "auction", "past", "vin_history"):
-            with self.assertRaises(marketcheck.EndpointNotConfirmed, msg=kind):
-                marketcheck._endpoint(kind)
+    def test_three_confirmed_endpoints(self):
+        self.assertEqual(marketcheck.ENDPOINTS["active"], "search/car/active")
+        self.assertEqual(marketcheck.ENDPOINTS["fsbo"], "search/car/fsbo/active")
+        self.assertEqual(marketcheck.ENDPOINTS["auction"], "search/car/auction/active")
 
-    def test_active_endpoint_is_known(self):
-        self.assertEqual(marketcheck._endpoint("active"), "search/car/active")
+    def test_unknown_kind_is_rejected(self):
+        with self.assertRaises(ValueError):
+            marketcheck.endpoint_for("past")
 
-    def test_past_inventory_is_not_a_verified_sale(self):
-        self.assertEqual(marketcheck.PAST_INVENTORY_PRICE_BASIS,
-                         "inferred_from_removal")
-        self.assertNotEqual(marketcheck.PAST_INVENTORY_PRICE_BASIS,
-                            comps.USABLE_PRICE_BASIS)
+    def test_no_past_inventory_endpoint(self):
+        """Past inventory is removals, not sales. It must not be reachable."""
+        self.assertNotIn("past", marketcheck.ENDPOINTS)
 
     def test_ingest_skips_without_key(self):
-        self.assertEqual(marketcheck.ingest(None).status, "skipped")
+        res = marketcheck.ingest(None, fieldmap_path=self.tmp)
+        self.assertEqual(res.status, "skipped")
+        self.assertIn("MARKETCHECK_API_KEY", res.message)
+
+    def test_ingest_blocked_while_schema_unconfirmed(self):
+        os.environ["MARKETCHECK_API_KEY"] = "dummy-key-for-test"
+        res = marketcheck.ingest(None, fieldmap_path=self.tmp)
+        self.assertEqual(res.status, "skipped")
+        self.assertIn("not confirmed", res.message)
+
+    def test_template_ships_unconfirmed(self):
+        marketcheck.write_fieldmap_template(self.tmp)
+        cfg = json.loads(self.tmp.read_text())
+        self.assertFalse(cfg["confirmed"])
+        with self.assertRaises(marketcheck.SchemaNotConfirmed):
+            marketcheck.load_fieldmap(self.tmp)
+
+    def test_dig_follows_dotted_paths(self):
+        item = {"build": {"year": 2008, "trim": "Carrera S"}, "miles": 51000}
+        self.assertEqual(marketcheck.dig(item, "build.year"), 2008)
+        self.assertEqual(marketcheck.dig(item, "miles"), 51000)
+        self.assertIsNone(marketcheck.dig(item, "build.missing"))
+        self.assertIsNone(marketcheck.dig(item, "nope.nope"))
+
+    def test_fallback_paths_are_used(self):
+        cfg = {"fields": {"url": "vdp_url"}, "fallbacks": {"url": ["source_url"]}}
+        self.assertEqual(
+            marketcheck._resolve({"source_url": "https://x.test/a"}, cfg, "url"),
+            "https://x.test/a")
+
+    def test_kind_determines_seller_and_listing_type(self):
+        cfg = marketcheck.FIELDMAP_TEMPLATE
+        item = {"vdp_url": "https://x.test/1", "heading": "2008 Porsche 911 Carrera S",
+                "build": {"year": 2008, "make": "Porsche", "model": "911"},
+                "miles": 51000, "price": 39500}
+        fsbo = marketcheck.to_record(item, cfg, "fsbo")["record"]
+        auction = marketcheck.to_record(item, cfg, "auction")["record"]
+        dealer = marketcheck.to_record(item, cfg, "active")["record"]
+        self.assertEqual(fsbo["seller_type"], "private")
+        self.assertEqual(fsbo["listing_type"], "fixed")
+        self.assertEqual(auction["seller_type"], "auction_house")
+        self.assertEqual(auction["listing_type"], "auction")
+        self.assertEqual(dealer["seller_type"], "dealer")
+
+    def test_mapping_produces_expected_record(self):
+        cfg = marketcheck.FIELDMAP_TEMPLATE
+        item = {"id": "abc", "vdp_url": "https://x.test/1",
+                "heading": "2008 Porsche 911 Carrera S Coupe",
+                "build": {"year": 2008, "make": "Porsche", "model": "911",
+                          "trim": "Carrera S", "transmission": "6-Speed Manual"},
+                "miles": "51,000", "price": "39500", "vin": "WP0AB29958S781234",
+                "dealer": {"name": "X Motors", "city": "Fresno", "state": "CA"}}
+        rec = marketcheck.to_record(item, cfg, "active")["record"]
+        self.assertEqual(rec["year"], 2008)
+        self.assertEqual(rec["generation"], "997.1")
+        self.assertEqual(rec["variant"], "Carrera S")
+        self.assertEqual(rec["transmission"], "manual")
+        self.assertEqual(rec["mileage"], 51000)
+        self.assertEqual(rec["price"], 39500.0)
+        self.assertEqual(rec["seller_state"], "CA")
+
+    def test_non_porsche_is_filtered(self):
+        cfg = marketcheck.FIELDMAP_TEMPLATE
+        item = {"vdp_url": "https://x.test/2", "heading": "2019 Honda Civic",
+                "build": {"year": 2019, "make": "Honda", "model": "Civic"}}
+        rec = marketcheck.to_record(item, cfg, "active")["record"]
+        self.assertFalse(marketcheck.is_911(rec, item, cfg))
+
+
+class TestDealerSitemapDiscovery(unittest.TestCase):
+    SITEMAP = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <url><loc>https://d.test/inventory/used-2008-porsche-911-carrera-s-1</loc></url>
+      <url><loc>https://d.test/blog/porsche-911-history</loc></url>
+      <url><loc>https://d.test/service/schedule</loc></url>
+      <url><loc>https://d.test/vehicle/2016-porsche-911-gts-9</loc></url>
+    </urlset>"""
+
+    INDEX = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <sitemap><loc>https://d.test/sitemap-inventory.xml</loc></sitemap>
+      <sitemap><loc>https://d.test/sitemap-blog.xml</loc></sitemap>
+    </sitemapindex>"""
+
+    def test_parses_urlset(self):
+        pages, nested = jsonld.parse_sitemap(self.SITEMAP)
+        self.assertEqual(len(pages), 4)
+        self.assertEqual(nested, [])
+
+    def test_parses_sitemap_index(self):
+        pages, nested = jsonld.parse_sitemap(self.INDEX)
+        self.assertEqual(pages, [])
+        self.assertEqual(len(nested), 2)
+
+    def test_filters_to_vehicle_pages(self):
+        pages, _ = jsonld.parse_sitemap(self.SITEMAP)
+        keep = [u for u in pages if jsonld.looks_like_vehicle_url(u)]
+        self.assertEqual(len(keep), 2)
+        self.assertTrue(all("/inventory/" in u or "/vehicle/" in u for u in keep))
+
+    def test_excludes_blog_and_service(self):
+        self.assertFalse(jsonld.looks_like_vehicle_url("https://d.test/blog/porsche-911"))
+        self.assertFalse(jsonld.looks_like_vehicle_url("https://d.test/service/porsche"))
+
+    def test_malformed_sitemap_returns_empty(self):
+        self.assertEqual(jsonld.parse_sitemap(b"not xml at all"), ([], []))
+
+    def test_discovery_refuses_domains_not_on_the_allowlist(self):
+        with self.assertRaises(http_util.NotAllowed):
+            jsonld.discover_urls("not-allowlisted.test")
+
+    def test_ingest_domain_reports_the_block_rather_than_crashing(self):
+        res = jsonld.ingest_domain(fresh_db(), "not-allowlisted.test")
+        self.assertEqual(res.status, "error")
+        self.assertIn("allowed_domains", res.message)
 
 
 class TestMechanicSheet(unittest.TestCase):

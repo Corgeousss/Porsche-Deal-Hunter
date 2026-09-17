@@ -103,6 +103,9 @@ To see the dashboard layout before you have real data:
 | `override <id> [...]` | Record real per-car repair/transport/days quotes. Replaces placeholders. |
 | `vin <VIN>` | Decode via NHTSA vPIC (free, no key); offline checks if unreachable. |
 | `assumptions [--set K V]` | List or change every cost assumption. |
+| `fetch marketcheck --kind active\|fsbo\|auction` | Dealer, private-party or auction inventory (paid key). |
+| `fetch dealer_jsonld --domain D` | Discover listings from an allowlisted dealer's sitemap (free). |
+| `marketcheck probe --kind K` | One real call; reports the actual response shape so the field map can be confirmed. |
 | `validate [--listing-url U]` | Live real-data validation. The only thing that can mark a source live-verified. |
 | `acceptance <id> --destination XX` | Full underwriting report for one car, or INSUFFICIENT DATA with the exact gap. |
 | `classic-com init-config \| status` | CLASSIC.COM licensed adapter setup. |
@@ -168,7 +171,7 @@ that tells you which cars are worth a phone call — not an appraisal.**
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v    # 98 tests
+python3 -m unittest discover -s tests -v    # 116 tests
 ```
 
 Covers the profit identity, the max-bid solve, mileage-adjustment direction and

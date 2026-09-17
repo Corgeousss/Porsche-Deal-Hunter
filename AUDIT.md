@@ -36,9 +36,10 @@ test · **DOC ONLY** = described, not built.
 |---|---|---|---|
 | Manual URL entry | **CODE+TESTS** | `TestManualEntry` (6 tests) | Nothing network-dependent — this path is genuinely complete |
 | NHTSA vPIC decode | **CODE+TESTS** | `TestVin` (4 tests) cover check-digit, WMI, year, format | `decode_via_vpic()` has **never executed**. Response field names (`Make`, `Model`, `ModelYear`, `ErrorCode`) are unconfirmed against a live payload |
-| Dealer JSON-LD | **CODE+TESTS** | `TestJsonLd` (3 tests) parse a hand-written schema.org document | `ingest_url()` has **never fetched a page**. robots.txt handling, redirects, charset, real dealer HTML: all unexercised |
+| Dealer JSON-LD (single URL) | **CODE+TESTS** | `TestJsonLd` (3 tests) parse a hand-written schema.org document | `ingest_url()` has **never fetched a page**. robots.txt handling, redirects, charset, real dealer HTML: all unexercised |
+| Dealer sitemap discovery | **CODE+TESTS** | `TestDealerSitemapDiscovery` (7 tests) cover sitemap/index parsing, URL filtering and the allowlist refusal | Never fetched a real sitemap. URL-shape heuristics are unproven against real dealer platforms |
 | Craigslist RSS | **CODE+TESTS** | `TestRss` (2 tests) parse a hand-written feed | Never fetched a real feed. Disabled by default |
-| MarketCheck | **CODE ONLY** | `TestMarketCheckAdapter` (5 tests) check config behaviour, not I/O | **Never called.** `active` + VIN-decode paths are documented literally; `private_party`, `auction`, `past`, `vin_history` paths are **unconfirmed** and raise `EndpointNotConfirmed` rather than guess. Response shape (`listings`, `build`, `dealer`, `media.photo_links`) unconfirmed |
+| MarketCheck | **CODE ONLY** | `TestMarketCheckAdapter` (12 tests) cover mapping, pagination guards and the schema gate, not I/O | **Never called.** The three endpoint PATHS are operator-confirmed against MarketCheck's docs. The RESPONSE SCHEMA is not: it lives in `data/marketcheck_fields.json` as candidates with `confirmed: false`, and ingestion is blocked until `marketcheck probe` confirms it against a real reply |
 | CLASSIC.COM | **CODE ONLY, AUTH DISABLED** | `TestClassicComAdapter` (10 tests) cover the config gate and price-basis classification | **Never called.** Base URL, auth style, every endpoint path and every response field name are operator-supplied config — the adapter refuses to run until they are filled in and marked confirmed |
 
 ### Core logic — no network, genuinely working
@@ -50,7 +51,7 @@ test · **DOC ONLY** = described, not built.
 | Comp validation guards | **CODE+TESTS** | `TestCompGuards` (5 tests) |
 | Provenance gates (price basis / permission basis) | **CODE+TESTS** | `TestProvenanceGates` (9 tests) |
 | Valuation engine | **CODE+TESTS** | `TestValuation` (8 tests) — median, mileage direction, capping, buyer premium, staleness |
-| Deal model + max-bid solve | **CODE+TESTS** | `TestDealMath` (8) + `TestTransactionCosts` (9) — identity holds under tax and auction premium |
+| Deal model + max-bid solve | **CODE+TESTS** | `TestDealMath` (8) + `TestTransactionCosts` (13) — identity holds under tax and auction premium; unset tax is never read as an exemption; preliminary vs underwritten status |
 | Per-car overrides | **CODE+TESTS** | `TestOverrides` (4 tests) |
 | Generation / variant / VIN normalization | **CODE+TESTS** | `TestGenerations` (4), `TestVin` (4) |
 | Validation workflow | **CODE+TESTS** | `TestValidationWorkflow` (7 tests) |
@@ -92,7 +93,7 @@ Honest list of what will most likely break on first live contact:
 
 ## Test suite composition
 
-98 tests, all passing:
+116 tests, all passing:
 
 ```bash
 python3 -m unittest discover -s tests -v

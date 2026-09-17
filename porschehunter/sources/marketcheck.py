@@ -1,215 +1,470 @@
-"""MarketCheck Automotive API client.
+"""MarketCheck Cars API client.
 
-MarketCheck is a commercial vehicle-listings API covering dealer, private-party
-and auction inventory, plus historical/past inventory. Documented at
-https://docs.marketcheck.com/docs/api/cars. Paid; set MARKETCHECK_API_KEY.
+Endpoints implemented (paths confirmed by the operator against MarketCheck's
+official documentation, https://docs.marketcheck.com/docs/api/cars):
 
-ENDPOINT COVERAGE (per MarketCheck's published Cars API docs)
--------------------------------------------------------------
-  active dealer listings   /v2/search/car/active
-  private-party listings   Private Party Inventory Search
-  auction listings         Auction Inventory Search
-  past/sold inventory      Past Inventory Search -- DEALER ONLY, US/CA.
-                           Does NOT cover private party or auction listings.
-  VIN history              listing history by VIN: past listings, price
-                           changes, mileage changes, seller information
-  VIN decode               /v2/decode/car/neovin/{vin}/specs
-  price prediction         /v2/predict/car/us/marketcheck_price/comparables
+    /v2/search/car/active           dealer inventory
+    /v2/search/car/fsbo/active      for-sale-by-owner (private party)
+    /v2/search/car/auction/active   auction inventory
 
-THE PAST-INVENTORY TRAP -- READ BEFORE USING IT FOR COMPS
-----------------------------------------------------------
-"Past Inventory" contains sold vehicles, EXPIRED listings and vehicles REMOVED
-from active inventory. A listing leaving a dealer's feed is a removal, not a
-transaction: the car may have been sold, withdrawn, traded, or relisted
-elsewhere, and the last price seen is the last ASKING price, not a sale price.
+WHY THE RESPONSE SCHEMA IS EXTERNALISED
+---------------------------------------
+This client was written WITHOUT access to a live key and WITHOUT being able to
+open the response-schema page. Rather than assert field names I have not seen,
+the mapping lives in `data/marketcheck_fields.json`, shipped with candidate
+defaults and `"confirmed": false`.
 
-This client therefore imports past-inventory records with
-price_basis='inferred_from_removal', which the valuation engine excludes. Only
-promote a record to 'verified_transaction' if your licence gives you an actual
-transaction price and you have confirmed which field carries it.
+The first real call confirms it, not me:
 
-CONFIRM AGAINST YOUR OWN PLAN before relying on any of this: exact paths,
-parameter names and entitlements depend on the contract you sign, and this file
-was written WITHOUT access to a live key -- no call here has ever been executed
-against the real API.
+    porschehunter marketcheck probe --kind active
+
+`probe` makes one minimal request, saves the raw JSON, prints the response's
+actual top-level keys and the actual keys of the first listing, and reports
+which mapped paths resolved and which did not. You then correct the file and
+set `"confirmed": true`.
+
+Ingestion refuses to run while the map is unconfirmed, so a wrong guess cannot
+quietly produce a database full of nulls.
+
+NOT IMPLEMENTED HERE
+--------------------
+Past Inventory (sold/expired/removed) is deliberately absent. Those records are
+REMOVALS, not transactions, and this tool will not let them become comps. See
+DATA_SOURCES.md.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 from .. import db as _db
 from .. import generations as _gens
 from .. import vin as _vin
 from .base import IngestResult
 
-# MarketCheck's documented host. Override if your plan is issued a different one.
 BASE_URL = os.environ.get("MARKETCHECK_BASE_URL", "https://api.marketcheck.com/v2")
+API_KEY_ENV = "MARKETCHECK_API_KEY"
+FIELDMAP_PATH = Path("data/marketcheck_fields.json")
 
-# Logical operation -> documented path. Paths that MarketCheck documents by
-# name rather than by literal URL are left as None so this client cannot
-# silently call a guessed endpoint.
+# Operator-confirmed against MarketCheck's official documentation.
 ENDPOINTS = {
     "active": "search/car/active",
-    "private_party": None,   # "Private Party Inventory Search" -- confirm path
-    "auction": None,         # "Auction Inventory Search"       -- confirm path
-    "past": None,            # "Past Inventory Search"          -- confirm path
-    "vin_history": None,     # "History by VIN"                 -- confirm path
-    "vin_decode": "decode/car/neovin/{vin}/specs",
+    "fsbo": "search/car/fsbo/active",
+    "auction": "search/car/auction/active",
 }
+KINDS = tuple(ENDPOINTS)
 
-
-class EndpointNotConfirmed(RuntimeError):
-    """Raised for an endpoint MarketCheck documents but whose exact path this
-    client has not had confirmed against a live plan."""
-API_KEY_ENV = "MARKETCHECK_API_KEY"
+# MarketCheck caps how deep a result set can be paged. Conservative default;
+# raise it only if your plan's docs say so.
+MAX_START = 9_000
+PAGE_ROWS = 50
 
 
 class NotConfigured(RuntimeError):
-    pass
+    """No API key."""
 
 
+class SchemaNotConfirmed(RuntimeError):
+    """The response field map has not been confirmed against a real response."""
+
+
+class MarketCheckError(RuntimeError):
+    """An API call failed."""
+
+
+class AuthError(MarketCheckError):
+    """401/403 -- key missing, wrong, or not entitled to this endpoint."""
+
+
+class RateLimited(MarketCheckError):
+    """429."""
+
+
+# ---------------------------------------------------------------------------
+# Field map
+# ---------------------------------------------------------------------------
+FIELDMAP_TEMPLATE = {
+    "_README": [
+        "Candidate field map for MarketCheck Cars API responses.",
+        "These paths are NOT confirmed. Run:  porschehunter marketcheck probe",
+        "It prints the real keys from a real response and tells you which of",
+        "these resolved. Correct anything wrong, then set confirmed: true.",
+        "Dotted paths descend into nested objects: 'build.year'.",
+    ],
+    "confirmed": False,
+    "envelope": {
+        "items": "listings",
+        "total": "num_found"
+    },
+    "fields": {
+        "listing_id": "id",
+        "url": "vdp_url",
+        "title": "heading",
+        "year": "build.year",
+        "make": "build.make",
+        "model": "build.model",
+        "trim": "build.trim",
+        "body_type": "build.body_type",
+        "transmission": "build.transmission",
+        "drivetrain": "build.drivetrain",
+        "engine": "build.engine",
+        "vin": "vin",
+        "mileage": "miles",
+        "price": "price",
+        "exterior_color": "exterior_color",
+        "interior_color": "interior_color",
+        "seller_name": "dealer.name",
+        "seller_city": "dealer.city",
+        "seller_state": "dealer.state",
+        "seller_zip": "dealer.zip",
+        "photos": "media.photo_links"
+    },
+    "fallbacks": {
+        "url": ["source_url", "vdp_url"],
+        "year": ["year"],
+        "seller_name": ["seller.name", "dealer_name"],
+        "seller_city": ["seller.city"],
+        "seller_state": ["seller.state"],
+        "seller_zip": ["seller.zip"]
+    }
+}
+
+
+def write_fieldmap_template(path: Path = FIELDMAP_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(FIELDMAP_TEMPLATE, indent=2) + "\n")
+
+
+def load_fieldmap(path: Path = FIELDMAP_PATH, require_confirmed: bool = True) -> dict:
+    if not path.exists():
+        write_fieldmap_template(path)
+    cfg = json.loads(path.read_text())
+    if require_confirmed and not cfg.get("confirmed"):
+        raise SchemaNotConfirmed(
+            f"{path} is not confirmed. The response field names in it are "
+            f"candidates, not verified. Run `porschehunter marketcheck probe "
+            f"--kind active` to see the real response, correct the file, then "
+            f"set \"confirmed\": true. Ingestion will not run until then, so a "
+            f"wrong guess cannot fill your database with nulls."
+        )
+    return cfg
+
+
+def dig(obj, path: str):
+    """Follow a dotted path. Returns None if any step is missing."""
+    if not path:
+        return None
+    cur = obj
+    for part in path.split("."):
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        elif isinstance(cur, list) and part.isdigit() and int(part) < len(cur):
+            cur = cur[int(part)]
+        else:
+            return None
+        if cur is None:
+            return None
+    return cur
+
+
+def _resolve(item: dict, cfg: dict, logical: str):
+    val = dig(item, (cfg.get("fields") or {}).get(logical, ""))
+    if val is not None:
+        return val
+    for alt in (cfg.get("fallbacks") or {}).get(logical, []):
+        val = dig(item, alt)
+        if val is not None:
+            return val
+    return None
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
 def api_key() -> str:
     key = os.environ.get(API_KEY_ENV, "").strip()
     if not key:
         raise NotConfigured(
-            f"{API_KEY_ENV} is not set. MarketCheck is a paid API: sign up at "
-            "marketcheck.com, choose a plan that includes the Cars search "
-            "endpoint, then export the key. Until then this source stays off "
-            "and you use manual entry plus dealer JSON-LD."
+            f"{API_KEY_ENV} is not set. MarketCheck is a paid API -- obtain a "
+            f"key from marketcheck.com for a plan that includes the endpoints "
+            f"you need, then set the environment variable."
         )
     return key
 
 
-def _get(path: str, params: dict, timeout: int = 30) -> dict:
+def _get(path: str, params: dict, timeout: int = 30, max_retries: int = 3) -> dict:
+    """GET with authorization, retry on transient failure, no retry on 4xx."""
     params = {**params, "api_key": api_key()}
-    url = f"{BASE_URL}/{path.lstrip('/')}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "porsche-deal-hunter/0.1",
-        "Accept": "application/json",
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError(f"MarketCheck HTTP {exc.code}: {body}") from exc
+    url = f"{BASE_URL.rstrip('/')}/{path.lstrip('/')}?{urllib.parse.urlencode(params)}"
+    safe_url = url.split("api_key=")[0] + "api_key=***"
+    last_exc = None
+
+    for attempt in range(max_retries):
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "porsche-deal-hunter/0.3",
+            "Accept": "application/json",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise MarketCheckError(
+                    f"{safe_url} returned non-JSON ({len(raw)} bytes): "
+                    f"{raw[:200]!r}") from exc
+
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")[:400]
+            if exc.code in (401, 403):
+                raise AuthError(
+                    f"HTTP {exc.code} from {safe_url}. Your key is missing, "
+                    f"invalid, or your plan is not entitled to this endpoint. "
+                    f"Do not retry -- check the key and your entitlements. "
+                    f"Body: {body}") from exc
+            if exc.code == 429:
+                wait = 2 ** attempt
+                last_exc = RateLimited(f"HTTP 429 from {safe_url}: {body}")
+                if attempt < max_retries - 1:
+                    time.sleep(wait)
+                    continue
+                raise last_exc from exc
+            if 400 <= exc.code < 500:
+                raise MarketCheckError(
+                    f"HTTP {exc.code} from {safe_url} -- request rejected, not "
+                    f"retrying. Body: {body}") from exc
+            # 5xx: transient
+            last_exc = MarketCheckError(f"HTTP {exc.code} from {safe_url}: {body}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise last_exc from exc
+
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_exc = MarketCheckError(
+                f"network failure calling {safe_url}: {type(exc).__name__}: {exc}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise last_exc from exc
+
+    raise last_exc or MarketCheckError("unreachable")
 
 
-def _endpoint(kind: str) -> str:
-    path = ENDPOINTS.get(kind)
-    if not path:
-        raise EndpointNotConfirmed(
-            f"MarketCheck documents a '{kind}' endpoint, but its exact path is "
-            f"not confirmed in this client. Look it up at "
-            f"https://docs.marketcheck.com/docs/api/cars, set "
-            f"ENDPOINTS['{kind}'], and verify against your plan's entitlements. "
-            f"This client will not call a guessed path."
-        )
-    return path
+def endpoint_for(kind: str) -> str:
+    if kind not in ENDPOINTS:
+        raise ValueError(f"Unknown kind {kind!r}. Valid: {', '.join(KINDS)}")
+    return ENDPOINTS[kind]
 
 
-def search_911(year_min: int | None = None, year_max: int | None = None,
-               rows: int = 50, start: int = 0, kind: str = "active", **extra) -> dict:
-    """Search 911s. `kind` selects active / private_party / auction / past."""
-    params = {
-        "make": "Porsche",
-        "model": "911",
-        "car_type": "used",
-        "rows": rows,
-        "start": start,
-        **extra,
-    }
+def search_page(kind: str, *, rows: int = PAGE_ROWS, start: int = 0,
+                year_min: int | None = None, year_max: int | None = None,
+                **extra) -> dict:
+    params = {"make": "Porsche", "model": "911", "rows": rows, "start": start,
+              **extra}
     if year_min:
         params["year_min"] = year_min
     if year_max:
         params["year_max"] = year_max
-    return _get(_endpoint(kind), params)
+    return _get(endpoint_for(kind), params)
 
 
-# Past-inventory records are removals, not transactions. See the module
-# docstring. This is the basis they are stored under, and it is excluded from
-# every valuation until you can prove an actual transaction price.
-PAST_INVENTORY_PRICE_BASIS = "inferred_from_removal"
+def probe(kind: str = "active", out_path: Path | None = None) -> dict:
+    """One real, minimal call. Reports the ACTUAL response shape.
+
+    This is the only honest way to confirm the field map, and it is what turns
+    'written' into 'verified'.
+    """
+    payload = search_page(kind, rows=1, start=0)
+    out_path = out_path or Path(f"data/marketcheck_probe_{kind}.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2)[:2_000_000])
+
+    cfg = load_fieldmap(require_confirmed=False)
+    env = cfg.get("envelope") or {}
+    items = dig(payload, env.get("items", "listings"))
+    first = items[0] if isinstance(items, list) and items else None
+
+    resolved, unresolved = {}, []
+    if first is not None:
+        for logical in (cfg.get("fields") or {}):
+            val = _resolve(first, cfg, logical)
+            if val is None:
+                unresolved.append(logical)
+            else:
+                resolved[logical] = val
+    return {
+        "kind": kind,
+        "endpoint": f"{BASE_URL}/{endpoint_for(kind)}",
+        "retrieved_at": _db.utcnow(),
+        "saved_to": str(out_path),
+        "response_top_level_keys": sorted(payload.keys()) if isinstance(payload, dict) else [],
+        "items_path_used": env.get("items", "listings"),
+        "items_found": len(items) if isinstance(items, list) else None,
+        "total_reported": dig(payload, env.get("total", "num_found")),
+        "first_item_keys": sorted(first.keys()) if isinstance(first, dict) else [],
+        "resolved": resolved,
+        "unresolved": unresolved,
+        "fieldmap_confirmed": bool(cfg.get("confirmed")),
+    }
 
 
-def to_record(item: dict) -> dict:
-    build = item.get("build") or {}
-    dealer = item.get("dealer") or {}
-    year = build.get("year") or item.get("year")
-    year = int(year) if year else None
+# ---------------------------------------------------------------------------
+# Mapping
+# ---------------------------------------------------------------------------
+def _to_int(v):
+    if v is None:
+        return None
+    try:
+        return int(float(str(v).replace(",", "").replace("$", "").strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_float(v):
+    if v is None:
+        return None
+    try:
+        return float(str(v).replace(",", "").replace("$", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+SELLER_TYPE_BY_KIND = {"active": "dealer", "fsbo": "private", "auction": "auction_house"}
+LISTING_TYPE_BY_KIND = {"active": "fixed", "fsbo": "fixed", "auction": "auction"}
+
+
+def to_record(item: dict, cfg: dict, kind: str) -> dict:
+    year = _to_int(_resolve(item, cfg, "year"))
     gen, _amb = _gens.from_year(year)
     descriptor = " ".join(str(x) for x in (
-        item.get("heading"), build.get("trim"), build.get("body_type"),
-        build.get("transmission")) if x)
+        _resolve(item, cfg, "title"), _resolve(item, cfg, "trim"),
+        _resolve(item, cfg, "body_type"), _resolve(item, cfg, "transmission")) if x)
+    photos = _resolve(item, cfg, "photos")
+    if isinstance(photos, str):
+        photos = [photos]
+    photos = [p for p in (photos or []) if isinstance(p, str)]
+
     return {
         "record": {
             "source_key": "marketcheck",
-            "source_listing_id": item.get("id"),
-            "url": item.get("vdp_url") or item.get("source_url") or "",
-            "title": item.get("heading"),
+            "source_listing_id": _resolve(item, cfg, "listing_id"),
+            "url": _resolve(item, cfg, "url") or "",
+            "title": _resolve(item, cfg, "title"),
             "year": year,
             "generation": gen,
             "variant": _gens.normalize_variant(descriptor),
             "body_style": _gens.normalize_body_style(descriptor),
             "transmission": _gens.normalize_transmission(descriptor),
-            "drivetrain": build.get("drivetrain"),
-            "engine": build.get("engine"),
-            "exterior_color": item.get("exterior_color"),
-            "interior_color": item.get("interior_color"),
-            "mileage": int(item["miles"]) if item.get("miles") else None,
-            "vin": _vin.normalize(item.get("vin")),
-            "price": float(item["price"]) if item.get("price") else None,
+            "drivetrain": _resolve(item, cfg, "drivetrain"),
+            "engine": _resolve(item, cfg, "engine"),
+            "exterior_color": _resolve(item, cfg, "exterior_color"),
+            "interior_color": _resolve(item, cfg, "interior_color"),
+            "mileage": _to_int(_resolve(item, cfg, "mileage")),
+            "vin": _vin.normalize(_resolve(item, cfg, "vin")),
+            "price": _to_float(_resolve(item, cfg, "price")),
             "currency": "USD",
-            "listing_type": "fixed",
-            "seller_type": "dealer" if dealer else "unknown",
-            "seller_name": dealer.get("name"),
-            "seller_city": dealer.get("city"),
-            "seller_state": dealer.get("state"),
-            "seller_zip": dealer.get("zip"),
-            "data_source_note": "MarketCheck Cars API (licensed data)",
+            "listing_type": LISTING_TYPE_BY_KIND.get(kind, "unknown"),
+            "seller_type": SELLER_TYPE_BY_KIND.get(kind, "unknown"),
+            "seller_name": _resolve(item, cfg, "seller_name"),
+            "seller_city": _resolve(item, cfg, "seller_city"),
+            "seller_state": _resolve(item, cfg, "seller_state"),
+            "seller_zip": _resolve(item, cfg, "seller_zip"),
+            "data_source_note": f"MarketCheck Cars API ({kind}), licensed data",
         },
-        "photos": [p for p in (item.get("media") or {}).get("photo_links", []) if isinstance(p, str)],
+        "photos": photos[:12],
     }
 
 
-def ingest(conn, year_min: int | None = None, year_max: int | None = None,
-           max_rows: int = 100, decode_vins: bool = False,
-           kind: str = "active") -> IngestResult:
+def is_911(rec: dict, item: dict, cfg: dict) -> bool:
+    make = str(_resolve(item, cfg, "make") or "")
+    model = str(_resolve(item, cfg, "model") or "")
+    blob = f"{make} {model} {rec.get('title') or ''}".lower()
+    if "porsche" not in blob:
+        return False
+    return "911" in blob or bool(rec.get("variant"))
+
+
+# ---------------------------------------------------------------------------
+# Ingestion
+# ---------------------------------------------------------------------------
+def ingest(conn, *, kind: str = "active", year_min: int | None = None,
+           year_max: int | None = None, max_rows: int = 200,
+           decode_vins: bool = False, fieldmap_path: Path = FIELDMAP_PATH,
+           porsche_only: bool = True) -> IngestResult:
     res = IngestResult(source_key="marketcheck")
     try:
         api_key()
-        _endpoint(kind)
-    except (NotConfigured, EndpointNotConfirmed) as exc:
+        cfg = load_fieldmap(fieldmap_path)
+        endpoint_for(kind)
+    except (NotConfigured, SchemaNotConfirmed, ValueError) as exc:
         res.status = "skipped"
         res.message = str(exc)
         return res
 
-    start, page = 0, 50
-    while start < max_rows:
-        payload = search_911(year_min, year_max, rows=min(page, max_rows - start),
-                             start=start, kind=kind)
-        items = payload.get("listings") or []
+    env = cfg.get("envelope") or {}
+    items_path = env.get("items", "listings")
+    total_path = env.get("total", "num_found")
+
+    start, total, skipped_no_url = 0, None, 0
+    while start < max_rows and start <= MAX_START:
+        rows = min(PAGE_ROWS, max_rows - start)
+        try:
+            payload = search_page(kind, rows=rows, start=start,
+                                  year_min=year_min, year_max=year_max)
+        except AuthError as exc:
+            res.status = "error"
+            res.message += f"{exc}\n"
+            return res
+        except MarketCheckError as exc:
+            res.status = "error"
+            res.message += f"page start={start}: {exc}\n"
+            break
+
+        if total is None:
+            total = dig(payload, total_path)
+        items = dig(payload, items_path)
+        if not isinstance(items, list):
+            res.status = "error"
+            res.message += (
+                f"envelope.items path '{items_path}' did not resolve to a list "
+                f"(got {type(items).__name__}). Run `marketcheck probe` and fix "
+                f"data/marketcheck_fields.json.\n")
+            break
         if not items:
             break
+
         for item in items:
             res.seen += 1
-            parsed = to_record(item)
+            parsed = to_record(item, cfg, kind)
             rec = parsed["record"]
+            if porsche_only and not is_911(rec, item, cfg):
+                continue
             if not rec["url"]:
+                skipped_no_url += 1
                 continue
             listing_id, created = _db.upsert_listing(conn, rec, raw=item)
             if parsed["photos"]:
-                _db.add_photos(conn, listing_id, parsed["photos"][:12])
+                _db.add_photos(conn, listing_id, parsed["photos"])
             if decode_vins and rec.get("vin"):
                 _vin.decode_and_store(conn, rec["vin"], model_year=rec.get("year"))
             res.new += int(created)
             res.updated += int(not created)
             res.listing_ids.append(listing_id)
+
         start += len(items)
-    res.message = f"fetched {res.seen} '{kind}' listings from MarketCheck"
+        if total is not None and start >= int(total or 0):
+            break
+
+    res.message += (f"{kind}: examined {res.seen} listings"
+                    + (f" of {total} reported" if total is not None else "")
+                    + f"; {res.new} new, {res.updated} updated")
+    if skipped_no_url:
+        res.message += f"; {skipped_no_url} skipped with no URL in the response"
     return res

@@ -218,6 +218,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE comps ADD COLUMN permission_basis TEXT NOT NULL DEFAULT 'unknown'")
         if "permission_note" not in have:
             conn.execute("ALTER TABLE comps ADD COLUMN permission_note TEXT")
+    if "assumptions" in existing:
+        if "status" not in cols("assumptions"):
+            conn.execute("ALTER TABLE assumptions ADD COLUMN status TEXT NOT NULL "
+                         "DEFAULT 'placeholder'")
+            conn.execute("UPDATE assumptions SET status='verified' WHERE verified=1")
     if "sources" in existing:
         have = cols("sources")
         if "live_verified_at" not in have:
@@ -251,11 +256,12 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
     for a in _assumptions.DEFAULTS:
         conn.execute(
-            """INSERT INTO assumptions (key, value, unit, basis, verified, updated_at)
-               VALUES (?,?,?,?,?,?)
+            """INSERT INTO assumptions (key, value, unit, basis, verified, status,
+                                        updated_at)
+               VALUES (?,?,?,?,?,?,?)
                ON CONFLICT(key) DO UPDATE SET
                    unit=excluded.unit, basis=excluded.basis""",
-            (a.key, a.value, a.unit, a.basis, int(a.verified), now),
+            (a.key, a.value, a.unit, a.basis, int(a.verified), a.status, now),
         )
     conn.commit()
 
@@ -276,17 +282,34 @@ def set_assumption(conn: sqlite3.Connection, key: str, value: float,
     row = conn.execute("SELECT * FROM assumptions WHERE key=?", (key,)).fetchone()
     if row is None:
         raise KeyError(f"unknown assumption: {key}")
+    new_verified = int(verified) if verified is not None else row["verified"]
+    # Any explicit set clears 'unset': the operator has now supplied a number.
+    new_status = "verified" if new_verified else "placeholder"
     conn.execute(
-        """UPDATE assumptions SET value=?, basis=?, verified=?, updated_at=? WHERE key=?""",
+        """UPDATE assumptions SET value=?, basis=?, verified=?, status=?,
+               updated_at=? WHERE key=?""",
         (
             float(value),
             basis if basis is not None else row["basis"],
-            int(verified) if verified is not None else row["verified"],
+            new_verified,
+            new_status,
             utcnow(),
             key,
         ),
     )
     conn.commit()
+
+
+def assumption_status(conn: sqlite3.Connection, key: str) -> str:
+    row = conn.execute("SELECT status FROM assumptions WHERE key=?", (key,)).fetchone()
+    if row is None:
+        return _assumptions.BY_KEY[key].status
+    return row["status"]
+
+
+def unset_assumptions(conn: sqlite3.Connection) -> list[str]:
+    return [r["key"] for r in conn.execute(
+        "SELECT key FROM assumptions WHERE status='unset' ORDER BY key")]
 
 
 # ---------------------------------------------------------------------------

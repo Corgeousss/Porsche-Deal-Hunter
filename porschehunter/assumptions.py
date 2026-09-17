@@ -21,10 +21,16 @@ class Assumption:
     unit: str
     basis: str
     verified: bool = False
+    # 'unset' means there is no honest default. The model will not treat the
+    # shipped value as a real figure, and a deal cannot be fully underwritten
+    # until the operator supplies one.
+    status: str = "placeholder"
 
     @property
     def label(self) -> str:
-        return "VERIFIED" if self.verified else "UNVERIFIED ASSUMPTION"
+        return {"verified": "VERIFIED",
+                "unset": "NOT SET -- YOU MUST SUPPLY THIS",
+                "placeholder": "UNVERIFIED PLACEHOLDER"}[self.status]
 
 
 # --- Profit target ----------------------------------------------------------
@@ -89,12 +95,14 @@ DEFAULTS = [
     ),
     Assumption(
         "purchase_tax_pct", 0.0, "fraction of purchase price",
-        "Transaction/use tax on the PURCHASE. Defaults to 0, which assumes you "
-        "hold a dealer or resale exemption and are not registering the car for "
-        "road use. IF THAT IS NOT TRUE THIS IS WRONG AND MATERIAL: at a 6-7% "
-        "rate a $40,000 car carries $2,400-$2,800 of tax that this model is "
-        "not charging you. Confirm your position with your accountant and set "
-        "this explicitly either way.",
+        "Transaction/use tax on the PURCHASE. THIS HAS NO DEFAULT. A 0% rate "
+        "assumes a dealer or resale exemption, which is a claim about YOUR tax "
+        "position that this tool cannot make for you -- and it is material: at "
+        "6.5% a $40,000 car carries $2,600 of tax. Until you set it, every "
+        "profit figure is PRELIMINARY and stated as 'before purchase tax'. "
+        "Set it either way: 0 if you have a confirmed exemption, or your "
+        "actual combined rate.",
+        status="unset",
     ),
     Assumption(
         "dealer_doc_fee", 500.0, "USD",
@@ -196,7 +204,17 @@ DEFAULTS = [
     ),
 ]
 
+# Keep `status` consistent with `verified` for everything that is not 'unset'.
+DEFAULTS = [
+    a if a.status == "unset"
+    else Assumption(a.key, a.value, a.unit, a.basis, a.verified,
+                    "verified" if a.verified else "placeholder")
+    for a in DEFAULTS
+]
+
 BY_KEY = {a.key: a for a in DEFAULTS}
+
+UNSET_KEYS = [a.key for a in DEFAULTS if a.status == "unset"]
 
 
 def default_value(key: str) -> float:

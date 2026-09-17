@@ -223,6 +223,11 @@ CREATE TABLE IF NOT EXISTS assumptions (
     unit       TEXT NOT NULL,
     basis      TEXT NOT NULL,
     verified   INTEGER NOT NULL DEFAULT 0,
+    -- unset       -- has no defensible default; the operator MUST supply it
+    --                before a deal can be called fully underwritten
+    -- placeholder -- a made-up default so the model runs. Not a quote.
+    -- verified    -- the operator supplied a real, confirmed number
+    status     TEXT NOT NULL DEFAULT 'placeholder',
     updated_at TEXT NOT NULL
 );
 

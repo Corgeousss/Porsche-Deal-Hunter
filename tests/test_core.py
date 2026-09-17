@@ -481,9 +481,45 @@ class TestTransactionCosts(unittest.TestCase):
                                40000 * 0.0625, places=2)
         self.assertLess(after["max_purchase_price"], before["max_purchase_price"])
 
-    def test_zero_tax_is_flagged_not_silent(self):
-        text = " ".join(self._eval()["detail"]["explanation"])
-        self.assertIn("resale/dealer exemption", text)
+    def test_unset_tax_is_never_treated_as_an_exemption(self):
+        r = self._eval()
+        text = " ".join(r["detail"]["explanation"])
+        self.assertIn("PURCHASE TAX IS NOT SET", text)
+        self.assertIn("not an exemption", text)
+        self.assertTrue(r["before_purchase_tax"])
+        self.assertIn("purchase_tax_pct is not set", r["underwriting_blockers"])
+
+    def test_confirmed_zero_tax_is_accepted_and_labelled(self):
+        db.set_assumption(self.conn, "purchase_tax_pct", 0.0,
+                          basis="resale exemption confirmed", verified=True)
+        r = self._eval()
+        self.assertFalse(r["before_purchase_tax"])
+        self.assertNotIn("purchase_tax_pct is not set", r["underwriting_blockers"])
+
+    def test_unvalued_when_no_comps(self):
+        conn = fresh_db()
+        r = deal.evaluate(conn, self.base, destination_state="OH", store=False)
+        self.assertEqual(r["underwriting_status"], "unvalued")
+
+    def test_preliminary_while_placeholders_remain(self):
+        self.assertEqual(self._eval()["underwriting_status"], "preliminary")
+
+    def test_fully_underwritten_once_everything_is_confirmed(self):
+        for key in ("repairs_997", "detail_and_photography", "title_and_admin",
+                    "ppi_cost", "sale_fee_pct", "sale_fee_cap", "carrying_cost_per_day",
+                    "days_to_sell", "risk_reserve_pct", "resale_haircut_pct",
+                    "transport_base", "transport_per_mile", "purchase_tax_pct",
+                    "dealer_doc_fee", "auction_buyer_premium_pct"):
+            db.set_assumption(self.conn, key,
+                              db.get_assumption(self.conn, key),
+                              basis="confirmed in test", verified=True)
+        r = deal.evaluate(self.conn, {**self.base, "seller_type": "private",
+                                      "listing_type": "fixed"},
+                          destination_state="OH", store=False,
+                          include_synthetic=True, transport_override=1100)
+        self.assertEqual(r["underwriting_blockers"], [])
+        self.assertEqual(r["underwriting_status"], "underwritten")
+        self.assertIn("FULLY UNDERWRITTEN", " ".join(r["detail"]["explanation"]))
 
     def test_max_bid_identity_holds_with_tax_and_auction(self):
         """P_max must still yield exactly the target once tax and an auction

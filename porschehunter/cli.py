@@ -112,11 +112,16 @@ def cmd_fetch(args):
     run_id = _db.start_run(conn, source)
     try:
         if source == "dealer_jsonld":
-            res = _jsonld.ingest(conn, args.url or [])
+            if args.domain:
+                res = _jsonld.ingest_domain(conn, args.domain,
+                                            max_pages=args.max_pages)
+            else:
+                res = _jsonld.ingest(conn, args.url or [])
         elif source == "craigslist_rss":
             res = _rss.ingest(conn)
         elif source == "marketcheck":
-            res = _marketcheck.ingest(conn, year_min=args.year_min, year_max=args.year_max,
+            res = _marketcheck.ingest(conn, kind=args.kind,
+                                      year_min=args.year_min, year_max=args.year_max,
                                       max_rows=args.max_rows)
         elif source == "manual":
             res = _manual.ingest(conn, args.url or [])
@@ -216,50 +221,122 @@ def cmd_value(args):
 def cmd_scan(args):
     conn = _conn(args)
     results = _deal.evaluate_all(conn, destination_state=args.destination)
-    flagged = [r for r in results if r["meets_threshold"]]
-    blocked = [r for r in results if r["status"] != "ok"]
+    target = _db.get_assumption(conn, "target_net_profit")
+
+    underwritten = [r for r in results
+                    if r.get("underwriting_status") == "underwritten"
+                    and r["meets_threshold"]]
+    preliminary = [r for r in results
+                   if r.get("underwriting_status") == "preliminary"
+                   and r["meets_threshold"]]
+    below = [r for r in results if r["status"] == "ok" and not r["meets_threshold"]]
+    unvalued = [r for r in results if r["status"] != "ok"]
 
     print(f"Evaluated {len(results)} active listings against a "
-          f"{_money(_db.get_assumption(conn, 'target_net_profit'))} net-profit target.\n")
+          f"{_money(target)} net-profit target.\n")
 
-    if flagged:
-        print(f"=== {len(flagged)} OPPORTUNITIES ===")
-        for r in sorted(flagged, key=lambda x: -(x["net_profit"] or 0)):
-            L = r["listing"]
-            print(f"\n#{L['id']} {L['title'] or L['url']}")
-            print(f"  ask {_money(r['asking_price'])} | comp value {_money(r['comp_value'])} "
-                  f"| resale {_money(r['expected_resale'])}")
-            print(f"  NET {_money(r['net_profit'])}   max bid {_money(r['max_purchase_price'])}"
-                  f"   ({r['detail']['valuation_confidence']} confidence, "
-                  f"{r['detail']['valuation_n_comps']} comps)")
-            print(f"  {L['url']}")
-            for line in r["detail"]["explanation"]:
-                print(f"    - {line}")
-    else:
+    def show(r, tag):
+        L = r["listing"]
+        print(f"\n[{tag}] #{L['id']} {L['title'] or L['url']}")
+        print(f"  ask {_money(r['asking_price'])} | comp value {_money(r['comp_value'])} "
+              f"| resale {_money(r['expected_resale'])}")
+        tax_note = "  (BEFORE PURCHASE TAX)" if r.get("before_purchase_tax") else ""
+        print(f"  NET {_money(r['net_profit'])}{tax_note}   "
+              f"max bid {_money(r['max_purchase_price'])}")
+        print(f"  {L['url']}")
+        for line in r["detail"]["explanation"]:
+            print(f"    - {line}")
+
+    if underwritten:
+        print(f"=== {len(underwritten)} FULLY UNDERWRITTEN OPPORTUNITIES ===")
+        print("Every cost input confirmed, purchase tax set, comps sufficient.")
+        for r in sorted(underwritten, key=lambda x: -(x["net_profit"] or 0)):
+            show(r, "UNDERWRITTEN")
+
+    if preliminary:
+        print(f"\n=== {len(preliminary)} PRELIMINARY OPPORTUNITIES ===")
+        print("These clear the target ON PAPER but are NOT fully underwritten. "
+              "Treat as leads to investigate, not confirmed profit.")
+        for r in sorted(preliminary, key=lambda x: -(x["net_profit"] or 0)):
+            show(r, "PRELIMINARY")
+            print(f"    BLOCKING: {'; '.join(r['underwriting_blockers'])}")
+
+    if not underwritten and not preliminary:
         print("No listing clears the profit threshold.")
 
-    if blocked:
-        print(f"\n=== {len(blocked)} NOT EVALUATED ===")
-        for r in blocked:
+    if below:
+        print(f"\n=== {len(below)} BELOW TARGET ===")
+        for r in below:
             L = r["listing"]
-            print(f"  #{L['id']} {L['title'] or L['url']}: {r['status']} -- "
-                  f"{r['detail'].get('explanation')}")
+            print(f"  #{L['id']} {L['title'] or L['url']}: net "
+                  f"{_money(r['net_profit'])} vs {_money(target)} target")
+
+    if unvalued:
+        print(f"\n=== {len(unvalued)} UNVALUED ===")
+        print("No verified comparable sales, so no valuation was produced.")
+        for r in unvalued:
+            L = r["listing"]
+            print(f"  #{L['id']} {L['year'] or '????'} 911 {L['variant'] or '?'} "
+                  f"{_money(L['price'])} {L['mileage'] or '?'} mi "
+                  f"{L['seller_state'] or '?'}")
+            print(f"      {L['url']}")
+            print(f"      {r['detail'].get('explanation')}")
     return 0
 
 
 def cmd_listings(args):
+    """Real listings as they are: spec, price, location, source URL, and an
+    explicit valuation status. Nothing is valued that cannot be valued."""
     conn = _conn(args)
-    rows = conn.execute(
-        "SELECT * FROM listings ORDER BY last_seen_at DESC LIMIT ?", (args.limit,)).fetchall()
+    sql = "SELECT * FROM listings"
+    params = []
+    if args.generation:
+        sql += " WHERE generation LIKE ?"
+        params.append(args.generation + "%")
+    sql += " ORDER BY last_seen_at DESC LIMIT ?"
+    params.append(args.limit)
+    rows = conn.execute(sql, params).fetchall()
+
+    if not rows:
+        print("No listings in the database.")
+        print("Add one:   porschehunter add <listing-url> --title ... --price ...")
+        print("Or fetch:  porschehunter fetch marketcheck --kind fsbo")
+        return 0
+
+    n_unvalued = 0
     for r in rows:
+        val = conn.execute(
+            """SELECT * FROM valuations WHERE listing_id=?
+               ORDER BY computed_at DESC LIMIT 1""", (r["id"],)).fetchone()
+        if val is None or val["status"] != "ok":
+            status = "UNVALUED - no usable comparable sales"
+            n_unvalued += 1
+        else:
+            status = (f"valued ${val['point_value']:,.0f} "
+                      f"({val['confidence']}, {val['n_comps']} comps)")
+
+        miles = f"{r['mileage']:,} mi" if r["mileage"] else "mileage unknown"
+        price = f"${r['price']:,.0f}" if r["price"] else "price unknown"
+        loc = ", ".join(x for x in (r["seller_city"], r["seller_state"]) if x) or "location unknown"
+        print(f"\n#{r['id']}  {r['year'] or '????'} 911 {r['variant'] or '(variant unknown)'}"
+              f"  [{r['generation'] or 'gen?'}]")
+        print(f"    price:    {price}")
+        print(f"    mileage:  {miles}")
+        print(f"    location: {loc}    seller: {r['seller_type'] or 'unknown'}")
+        print(f"    VIN:      {r['vin'] or 'unknown'}")
+        print(f"    source:   {r['source_key']}   retrieved {r['fetched_at']}")
+        print(f"    URL:      {r['url']}")
+        print(f"    status:   {status}")
         missing = [m["field"] for m in conn.execute(
-            "SELECT field FROM missing_fields WHERE listing_id=?", (r["id"],))]
-        print(f"#{r['id']:<4} {r['source_key']:<20} {r['year'] or '????'} "
-              f"{r['generation'] or '?':<7} {(r['variant'] or '?'):<14} "
-              f"{_money(r['price']):>10}  {r['mileage'] or '?'} mi")
-        print(f"      {r['url']}")
-        print(f"      fetched {r['fetched_at']}"
-              + (f" | missing: {', '.join(missing)}" if missing else ""))
+            "SELECT field FROM missing_fields WHERE listing_id=? ORDER BY field",
+            (r["id"],))]
+        if missing:
+            print(f"    missing:  {', '.join(missing)}")
+
+    print(f"\n{len(rows)} listing(s); {n_unvalued} unvalued.")
+    if n_unvalued:
+        print("Unvalued means no verified comparable sales exist for that car. "
+              "No valuation is shown because none can be computed.")
     return 0
 
 
@@ -304,12 +381,28 @@ def cmd_assumptions(args):
             return 1
         print(f"{key} = {value}" + ("  [marked VERIFIED]" if args.verified else ""))
         return 0
-    for r in _db.all_assumptions(conn):
-        tag = "VERIFIED  " if r["verified"] else "UNVERIFIED"
-        print(f"[{tag}] {r['key']:32} {r['value']:>12,.4g} {r['unit']}")
+    rows = _db.all_assumptions(conn)
+    tags = {"verified": "VERIFIED  ", "unset": "NOT SET   ",
+            "placeholder": "UNVERIFIED"}
+    for r in rows:
+        status = r["status"] if "status" in r.keys() else (
+            "verified" if r["verified"] else "placeholder")
+        print(f"[{tags.get(status, 'UNVERIFIED')}] {r['key']:32} "
+              f"{r['value']:>12,.4g} {r['unit']}")
         print(f"             {r['basis']}")
-    unver = sum(1 for r in _db.all_assumptions(conn) if not r["verified"])
-    print(f"\n{unver} assumptions are unverified placeholders. Replace them with "
+    unset = _db.unset_assumptions(conn)
+    unver = sum(1 for r in rows
+                if not r["verified"] and r["key"] not in unset)
+    print()
+    if unset:
+        print(f"{len(unset)} assumption(s) are NOT SET and have no honest default: "
+              f"{', '.join(unset)}.")
+        print("No deal can be fully underwritten until you set them. For tax:")
+        print("  porschehunter assumptions --set purchase_tax_pct 0 "
+              "--basis \"resale exemption confirmed <date>\" --verified")
+        print("  porschehunter assumptions --set purchase_tax_pct 0.065 "
+              "--basis \"OH combined rate confirmed <date>\" --verified")
+    print(f"{unver} assumptions are unverified placeholders. Replace them with "
           f"your own quotes before trusting any profit figure.")
     return 0
 
@@ -406,6 +499,56 @@ def cmd_acceptance(args):
     return 0 if passed else 2
 
 
+def cmd_marketcheck(args):
+    if args.mc_cmd == "init-fieldmap":
+        path = Path(args.path)
+        if path.exists() and not args.force:
+            print(f"{path} already exists. Use --force to overwrite.", file=sys.stderr)
+            return 1
+        _marketcheck.write_fieldmap_template(path)
+        print(f"Wrote candidate field map to {path}")
+        print("These field names are NOT confirmed. Run "
+              "`porschehunter marketcheck probe` once you have a key.")
+        return 0
+
+    # probe -- one real call
+    try:
+        info = _marketcheck.probe(args.kind)
+    except _marketcheck.NotConfigured as exc:
+        print(f"BLOCKED: {exc}", file=sys.stderr)
+        return 1
+    except _marketcheck.AuthError as exc:
+        print(f"AUTH FAILED: {exc}", file=sys.stderr)
+        return 1
+    except _marketcheck.MarketCheckError as exc:
+        print(f"CALL FAILED: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Endpoint:      {info['endpoint']}")
+    print(f"Retrieved at:  {info['retrieved_at']}")
+    print(f"Raw response:  {info['saved_to']}")
+    print(f"Total reported: {info['total_reported']}")
+    print(f"Items found in this page: {info['items_found']} "
+          f"(via envelope.items='{info['items_path_used']}')")
+    print(f"\nResponse top-level keys: {', '.join(info['response_top_level_keys'])}")
+    print(f"\nFirst listing's actual keys:\n  {', '.join(info['first_item_keys'])}")
+    print(f"\nMapped fields that RESOLVED ({len(info['resolved'])}):")
+    for k, v in info["resolved"].items():
+        print(f"  {k:16} = {str(v)[:60]}")
+    if info["unresolved"]:
+        print(f"\nMapped fields that did NOT resolve ({len(info['unresolved'])}):")
+        for k in info["unresolved"]:
+            print(f"  {k}")
+        print("\nFix these paths in data/marketcheck_fields.json using the "
+              "actual keys listed above.")
+    if not info["fieldmap_confirmed"]:
+        print('\nWhen the map is right, set "confirmed": true in '
+              "data/marketcheck_fields.json. Ingestion stays blocked until then.")
+    else:
+        print("\nField map is marked confirmed. `fetch marketcheck` will run.")
+    return 0
+
+
 def cmd_serve(args):
     from . import dashboard
     dashboard.serve(args.db, host=args.host, port=args.port,
@@ -446,9 +589,18 @@ def build_parser():
 
     f = sub.add_parser("fetch", help="run an automated connector")
     f.add_argument("source", choices=["dealer_jsonld", "craigslist_rss", "marketcheck", "manual"])
-    f.add_argument("--url", action="append")
+    f.add_argument("--url", action="append",
+                   help="dealer_jsonld: one listing URL (repeatable)")
+    f.add_argument("--domain",
+                   help="dealer_jsonld: discover listings from this allowlisted "
+                        "domain's sitemap (robots.txt enforced, rate limited)")
+    f.add_argument("--max-pages", type=int, default=40,
+                   help="dealer_jsonld --domain: cap on pages fetched")
+    f.add_argument("--kind", default="active", choices=list(_marketcheck.KINDS),
+                   help="marketcheck: active=dealer, fsbo=private party, "
+                        "auction=auction inventory")
     f.add_argument("--year-min", type=int); f.add_argument("--year-max", type=int)
-    f.add_argument("--max-rows", type=int, default=100)
+    f.add_argument("--max-rows", type=int, default=200)
     f.set_defaults(func=cmd_fetch)
 
     c = sub.add_parser("comps", help="documented completed sales")
@@ -487,7 +639,9 @@ def build_parser():
     s.add_argument("--destination", required=True, help=DEST_STATE_HELP)
     s.set_defaults(func=cmd_scan)
 
-    l = sub.add_parser("listings"); l.add_argument("--limit", type=int, default=50)
+    l = sub.add_parser("listings", help="show real listings and their valuation status")
+    l.add_argument("--limit", type=int, default=50)
+    l.add_argument("--generation", help="filter, e.g. 997 or 991.2")
     l.set_defaults(func=cmd_listings)
 
     ov = sub.add_parser("override",
@@ -529,6 +683,17 @@ def build_parser():
     cms = cmsub.add_parser("status")
     cms.add_argument("--path", default=str(_classic.CONFIG_PATH))
     cms.set_defaults(func=cmd_classic)
+
+    mk = sub.add_parser("marketcheck", help="MarketCheck API setup and schema probe")
+    mksub = mk.add_subparsers(dest="mc_cmd", required=True)
+    mkp = mksub.add_parser("probe",
+                           help="make ONE real call and report the actual response shape")
+    mkp.add_argument("--kind", default="active", choices=list(_marketcheck.KINDS))
+    mkp.set_defaults(func=cmd_marketcheck)
+    mkf = mksub.add_parser("init-fieldmap")
+    mkf.add_argument("--path", default=str(_marketcheck.FIELDMAP_PATH))
+    mkf.add_argument("--force", action="store_true")
+    mkf.set_defaults(func=cmd_marketcheck)
 
     sh = sub.add_parser("sheet", help="export the mechanic cost input sheet")
     sh.add_argument("--out", default="data/cost_input_sheet.html",
