@@ -25,6 +25,7 @@ import json
 import sqlite3
 import statistics
 
+from . import comps as _comps
 from . import db as _db
 from . import generations as _gens
 
@@ -61,7 +62,10 @@ def select_comps(conn: sqlite3.Connection, subject: dict,
 
     def query(gen_list, use_variant, use_body, use_mileage, use_year):
         synth_clause = "" if include_synthetic else " AND is_synthetic=0"
-        sql = [f"SELECT * FROM comps WHERE 1=1{synth_clause} AND sale_date>=?",
+        # Only verified transactions we are permitted to use ever reach a
+        # valuation. Asking prices and inferred sales are stored but excluded.
+        usable = _comps.usable_sql_clause()
+        sql = [f"SELECT * FROM comps WHERE {usable}{synth_clause} AND sale_date>=?",
                f"AND generation IN ({','.join('?' * len(gen_list))})"]
         args: list = [cutoff, *gen_list]
         if use_variant and variant:
@@ -94,6 +98,38 @@ def select_comps(conn: sqlite3.Connection, subject: dict,
     # Nothing met the bar; return the widest set so the caller can explain.
     rows = query(family_gens, False, False, False, False)
     return rows, {"steps": steps, "used": None, "widened": True}
+
+
+def _excluded_breakdown(conn: sqlite3.Connection, subject: dict,
+                        today: _dt.date, include_synthetic: bool = False) -> dict:
+    """Comps that match the car but are barred on provenance grounds. This is
+    usually the real reason a valuation cannot be produced, so it is surfaced
+    rather than silently dropped."""
+    gens = _gens.expand(_gens.family(subject.get("generation"))) or []
+    if not gens:
+        return {}
+    max_age = _db.get_assumption(conn, "comp_max_age_days")
+    cutoff = (today - _dt.timedelta(days=int(max_age))).isoformat()
+    synth_clause = "" if include_synthetic else " AND is_synthetic=0"
+    rows = conn.execute(
+        f"""SELECT price_basis, permission_basis, COUNT(*) AS n FROM comps
+            WHERE sale_date>=?{synth_clause}
+              AND generation IN ({','.join('?' * len(gens))})
+              AND NOT ({_comps.usable_sql_clause()})
+            GROUP BY price_basis, permission_basis""",
+        [cutoff, *gens]).fetchall()
+    out = {"total": 0, "reasons": []}
+    for r in rows:
+        out["total"] += r["n"]
+        why = []
+        if r["price_basis"] != _comps.USABLE_PRICE_BASIS:
+            why.append(f"price_basis={r['price_basis']} "
+                       f"({_comps.PRICE_BASES.get(r['price_basis'], '?')})")
+        if r["permission_basis"] not in _comps.USABLE_PERMISSION_BASES:
+            why.append(f"permission_basis={r['permission_basis']} "
+                       f"({_comps.PERMISSION_BASES.get(r['permission_basis'], '?')})")
+        out["reasons"].append({"n": r["n"], "why": "; ".join(why)})
+    return out
 
 
 def adjust_comp(conn: sqlite3.Connection, comp: sqlite3.Row, subject: dict,
@@ -142,6 +178,8 @@ def adjust_comp(conn: sqlite3.Connection, comp: sqlite3.Row, subject: dict,
         "comp_id": comp["id"],
         "source_url": comp["source_url"],
         "venue": comp["venue"],
+        "price_basis": comp["price_basis"],
+        "permission_basis": comp["permission_basis"],
         "sale_date": comp["sale_date"],
         "sale_price": float(comp["sale_price"]),
         "year": comp["year"],
@@ -183,6 +221,8 @@ def value_listing(conn: sqlite3.Connection, listing: sqlite3.Row | dict,
         return result
 
     rows, selection = select_comps(conn, subject, today, include_synthetic=include_synthetic)
+    selection["excluded"] = _excluded_breakdown(conn, subject, today,
+                                                include_synthetic=include_synthetic)
     min_low = int(_db.get_assumption(conn, "min_comps_low_confidence"))
     min_med = int(_db.get_assumption(conn, "min_comps_medium_confidence"))
     min_high = int(_db.get_assumption(conn, "min_comps_high_confidence"))
@@ -197,10 +237,13 @@ def value_listing(conn: sqlite3.Connection, listing: sqlite3.Row | dict,
             "detail": {
                 "selection": selection,
                 "explanation": (
-                    f"Only {len(rows)} documented completed sale(s) match this car; "
-                    f"{min_low} are required. Record more comps with "
-                    f"`comps add` before this car can be valued. No estimate is "
-                    f"produced from thin data."
+                    f"INSUFFICIENT DATA: only {len(rows)} usable verified sale(s) "
+                    f"match this car; {min_low} are required. "
+                    + (f"{selection['excluded']['total']} further matching record(s) "
+                       f"were excluded on provenance grounds "
+                       f"({'; '.join(r['why'] for r in selection['excluded']['reasons'])}). "
+                       if selection.get("excluded", {}).get("total") else "")
+                    + "No estimate is produced from thin data."
                 ),
             },
         }

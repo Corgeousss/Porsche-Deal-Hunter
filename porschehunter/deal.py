@@ -4,20 +4,25 @@ The arithmetic, stated plainly:
 
     expected_resale = comp_value * (1 - resale_haircut)
 
-    costs(P) = P
-             + repairs + detail_and_photography
-             + transport
-             + title_and_admin
-             + sale_fee(expected_resale)
-             + carrying (days_to_sell * carrying_cost_per_day)
-             + risk_reserve (risk_pct * P)
+    costs(P) = P * (1 + k)  +  fixed_costs
+
+where k is every rate that scales with the purchase price:
+
+    k = purchase_tax_pct            (0 if you hold a resale exemption)
+      + auction_buyer_premium_pct   (auction listings only)
+      + risk_reserve_pct
+
+and fixed_costs is everything that does not:
+
+    ppi + repairs + detail_and_photography + transport + title_and_admin
+      + dealer_doc_fee (dealer sellers only)
+      + sale_fee(expected_resale) + carrying(days * per_day)
 
     net(P) = expected_resale - costs(P)
 
-Because both the purchase price and the risk reserve scale with P, solving
-net(P) = target for P gives the maximum you can pay:
+Solving net(P) = target for P gives the maximum you can pay:
 
-    P_max = (expected_resale - fixed_costs - target) / (1 + risk_pct)
+    P_max = (expected_resale - fixed_costs - target) / (1 + k)
 
 Every input is either a documented comp (via valuation.py) or a named entry in
 the assumption register, and the breakdown returned here labels which.
@@ -97,6 +102,7 @@ def evaluate(conn: sqlite3.Connection, listing: sqlite3.Row | dict, *,
 
     # --- cost lines ---------------------------------------------------------
     lines: list[dict] = []
+    applied_notes: list[str] = []
 
     rk = repairs_key_for(subject.get("generation"))
     if repairs_override is not None:
@@ -134,6 +140,22 @@ def evaluate(conn: sqlite3.Connection, listing: sqlite3.Row | dict, *,
     admin = _db.get_assumption(conn, "title_and_admin")
     lines.append(_line(conn, "title_and_admin", admin))
 
+    # Pre-purchase inspection: always, on every car.
+    ppi = _db.get_assumption(conn, "ppi_cost")
+    lines.append(_line(conn, "ppi_cost", ppi))
+
+    # Dealer documentation fee: only when the seller is a dealer.
+    seller_type = (subject.get("seller_type") or "unknown").lower()
+    if seller_type == "dealer":
+        doc_fee = _db.get_assumption(conn, "dealer_doc_fee")
+        lines.append(_line(conn, "dealer_doc_fee", doc_fee,
+                           "applied because seller_type is 'dealer'"))
+    elif seller_type == "unknown":
+        applied_notes.append(
+            "Seller type is unknown, so no dealer documentation fee was charged. "
+            "If this is a dealer, add ~$"
+            f"{_db.get_assumption(conn, 'dealer_doc_fee'):,.0f}.")
+
     fee_pct = _db.get_assumption(conn, "sale_fee_pct")
     fee_cap = _db.get_assumption(conn, "sale_fee_cap")
     sale_fee = min(expected_resale * fee_pct, fee_cap)
@@ -149,24 +171,60 @@ def evaluate(conn: sqlite3.Connection, listing: sqlite3.Row | dict, *,
                   "verified": False, "note": "UNVERIFIED"})
 
     fixed_costs = sum(l["amount"] for l in lines)
+
+    # --- rates that scale with the purchase price ---------------------------
     risk_pct = _db.get_assumption(conn, "risk_reserve_pct")
+    tax_pct = _db.get_assumption(conn, "purchase_tax_pct")
+    listing_type = (subject.get("listing_type") or "unknown").lower()
+    auction_pct = (_db.get_assumption(conn, "auction_buyer_premium_pct")
+                   if listing_type == "auction" else 0.0)
+    if listing_type == "unknown":
+        applied_notes.append(
+            "Listing type is unknown, so no auction buyer premium was charged. "
+            "If this is an auction, add "
+            f"{_db.get_assumption(conn, 'auction_buyer_premium_pct'):.1%} of the "
+            "hammer price.")
+    if tax_pct == 0:
+        applied_notes.append(
+            "Purchase tax is set to 0%, which assumes a resale/dealer exemption. "
+            "If you will pay transaction or use tax on the purchase, set "
+            "`purchase_tax_pct` -- at 6% on a $40,000 car that is $2,400 this "
+            "model is currently not charging you.")
+
+    rate_lines = [
+        {"key": "purchase_tax", "rate": tax_pct, "basis": BY_KEY["purchase_tax_pct"].basis,
+         "verified": BY_KEY["purchase_tax_pct"].verified},
+        {"key": "auction_buyer_premium", "rate": auction_pct,
+         "basis": (f"{auction_pct:.1%} of the purchase price (auction listing)"
+                   if auction_pct else "not an auction listing -- not applied"),
+         "verified": False},
+        {"key": "risk_reserve", "rate": risk_pct,
+         "basis": BY_KEY["risk_reserve_pct"].basis, "verified": False},
+    ]
+    k = tax_pct + auction_pct + risk_pct
 
     # --- max purchase price -------------------------------------------------
-    max_purchase = (expected_resale - fixed_costs - target) / (1 + risk_pct)
+    max_purchase = (expected_resale - fixed_costs - target) / (1 + k)
 
     # --- profit at the actual asking price ----------------------------------
     if asking is not None:
+        for rl in rate_lines:
+            rl["amount"] = round(asking * rl["rate"], 2)
         risk_reserve = asking * risk_pct
-        total_cost = asking + fixed_costs + risk_reserve
+        proportional = asking * k
+        total_cost = asking + proportional + fixed_costs
         net_profit = expected_resale - total_cost
     else:
-        risk_reserve = total_cost = net_profit = None
+        for rl in rate_lines:
+            rl["amount"] = None
+        risk_reserve = proportional = total_cost = net_profit = None
 
     meets = bool(net_profit is not None and net_profit >= target)
 
     # --- why does it look undervalued? -------------------------------------
     explanation = _explain(subject, val, comp_value, expected_resale, asking,
                            net_profit, max_purchase, target, fixed_costs, lines)
+    explanation.extend(applied_notes)
 
     out = {
         "status": "ok",
@@ -174,6 +232,8 @@ def evaluate(conn: sqlite3.Connection, listing: sqlite3.Row | dict, *,
         "comp_value": round(comp_value, 2),
         "expected_resale": round(expected_resale, 2),
         "fixed_costs": round(fixed_costs, 2),
+        "proportional_cost": round(proportional, 2) if proportional is not None else None,
+        "proportional_rate": round(k, 6),
         "risk_reserve": round(risk_reserve, 2) if risk_reserve is not None else None,
         "total_cost": round(total_cost, 2) if total_cost is not None else None,
         "net_profit": round(net_profit, 2) if net_profit is not None else None,
@@ -182,11 +242,16 @@ def evaluate(conn: sqlite3.Connection, listing: sqlite3.Row | dict, *,
         "meets_threshold": meets,
         "detail": {
             "cost_lines": lines,
+            "rate_lines": rate_lines,
             "risk_reserve_pct": risk_pct,
+            "purchase_tax_pct": tax_pct,
+            "auction_buyer_premium_pct": auction_pct,
             "resale_haircut_pct": haircut,
             "destination_state": destination_state,
             "explanation": explanation,
-            "unverified_lines": [l["key"] for l in lines if not l["verified"]],
+            "unverified_lines": ([l["key"] for l in lines if not l["verified"]]
+                                 + [r["key"] for r in rate_lines
+                                    if not r["verified"] and r["rate"]]),
             "valuation_confidence": val["confidence"],
             "valuation_n_comps": val["n_comps"],
         },

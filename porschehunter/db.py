@@ -75,38 +75,43 @@ SOURCE_REGISTRY = [
         authorized="yes_with_credentials",
         requires_credentials=1,
         cost_notes=(
-            "Commercial, paid. Self-serve tiers exist plus custom enterprise "
-            "pricing; request a quote for the endpoints you need. "
-            "COST NOT VERIFIED IN THIS REPO -- confirm current pricing with "
-            "MarketCheck before budgeting."
+            "Commercial, paid. PRICING NOT VERIFIED IN THIS REPO -- request a "
+            "quote naming the exact endpoints you need. Assume nothing."
         ),
-        terms_url="https://docs.marketcheck.com/",
+        terms_url="https://docs.marketcheck.com/docs/api/cars",
         limitations=(
-            "Strongest coverage is franchise/independent DEALER inventory. "
-            "Private-party Craigslist/Facebook listings are largely out of "
-            "scope. Sold/history endpoints are separately priced."
+            "Documents dealer active, Private Party and Auction inventory "
+            "search, Past Inventory (sold/expired/removed), History by VIN, "
+            "VIN decode and price prediction. CRITICAL: Past Inventory is "
+            "DEALER ONLY (US/CA) and represents REMOVALS, not confirmed "
+            "transactions -- imported as price_basis='inferred_from_removal' "
+            "and excluded from valuations. Ask MarketCheck directly which "
+            "endpoint, if any, returns a price a buyer actually paid."
         ),
         enabled=0,
     ),
     dict(
         key="classic_com",
-        name="CLASSIC.COM",
-        access_method="email_alert",
-        authorized="manual_only",
-        requires_credentials=0,
+        name="CLASSIC.COM (licensed third-party API)",
+        access_method="api",
+        authorized="yes_with_credentials",
+        requires_credentials=1,
         cost_notes=(
-            "Free account gives market alerts and 30 days of visible sold "
-            "prices; a paid membership unlocks full historical sold records. "
-            "No documented self-serve public API -- data licensing is a "
-            "direct commercial conversation with them."
+            "Licensed, negotiated directly with datasupport@classic.com. Not "
+            "self-serve. PRICING NOT KNOWN -- ask them; assume nothing."
         ),
-        terms_url="https://www.classic.com/",
+        terms_url="https://support.classic.com/classic.com-api",
         limitations=(
-            "Best used as a comp SOURCE, not a listing feed: it aggregates "
-            "completed sales across auction houses. Ingest by pasting the "
-            "sold-listing URL and sale price into the comps table."
+            "Official API for licensed third parties covering taxonomy, sales "
+            "history and comparable sales. This is the correct primary route "
+            "for verified completed-sale comps. NOTE: their historical database "
+            "preserves removed listings at their final 'Last Asking' price, "
+            "which is NOT a transaction -- the adapter fails closed and stores "
+            "anything it cannot prove sold as price_basis='last_asking', "
+            "excluded from valuations. Adapter written; authentication "
+            "DISABLED until licensed credentials and endpoint config exist."
         ),
-        enabled=1,
+        enabled=0,
     ),
     dict(
         key="bring_a_trailer",
@@ -117,9 +122,13 @@ SOURCE_REGISTRY = [
         cost_notes="Free to read. No public API and no data-licensing product.",
         terms_url="https://bringatrailer.com/terms-of-service/",
         limitations=(
-            "No authorized programmatic access. Completed auctions are the "
-            "single best public comp source for 911s -- record them by hand "
-            "via `comps add`, including the buyer premium treatment."
+            "No authorized programmatic access and no data-licensing product. "
+            "Use as a HUMAN REFERENCE only. Systematically aggregating their "
+            "auction results into this database needs permission from BaT -- "
+            "manual entry does not make it acceptable. If you obtain "
+            "permission, record it via --permission-basis "
+            "operator_asserts_permission --permission-note. Otherwise license "
+            "the same transactions through CLASSIC.COM."
         ),
         enabled=1,
     ),
@@ -193,7 +202,33 @@ SOURCE_REGISTRY = [
 ]
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after a database was first created."""
+    def cols(table):
+        return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+    existing = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+
+    if "comps" in existing:
+        have = cols("comps")
+        if "price_basis" not in have:
+            conn.execute("ALTER TABLE comps ADD COLUMN price_basis TEXT NOT NULL DEFAULT 'unknown'")
+        if "permission_basis" not in have:
+            conn.execute("ALTER TABLE comps ADD COLUMN permission_basis TEXT NOT NULL DEFAULT 'unknown'")
+        if "permission_note" not in have:
+            conn.execute("ALTER TABLE comps ADD COLUMN permission_note TEXT")
+    if "sources" in existing:
+        have = cols("sources")
+        if "live_verified_at" not in have:
+            conn.execute("ALTER TABLE sources ADD COLUMN live_verified_at TEXT")
+        if "live_verified_note" not in have:
+            conn.execute("ALTER TABLE sources ADD COLUMN live_verified_note TEXT")
+    conn.commit()
+
+
 def init_db(conn: sqlite3.Connection) -> None:
+    _migrate(conn)
     conn.executescript(SCHEMA_PATH.read_text())
     now = utcnow()
     for s in SOURCE_REGISTRY:

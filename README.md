@@ -18,7 +18,13 @@ Python 3.11+, standard library only. No dependencies, no build step.
 5. Serves a plain dashboard with the numbers, the comps behind them and the
    source links.
 
-## The two rules this codebase enforces in code
+> **Status: no connector has yet completed a live call to a real endpoint.**
+> Every network path is implemented and unit-tested against in-memory payloads,
+> never run against a live service. See **[AUDIT.md](AUDIT.md)** for the
+> component-by-component breakdown, and run `validate` on a networked machine
+> to change that.
+
+## The three rules this codebase enforces in code
 
 **1. No invented vehicles, prices or comparables.**
 A comp requires a real `http(s)` URL, a real sale date and a positive price, or
@@ -27,15 +33,23 @@ returns `insufficient_comps` and **no number at all** — it does not estimate
 from thin data. Test fixtures are marked `is_synthetic=1` and are excluded from
 every production query.
 
-**2. No bypassing marketplace access restrictions.**
+**2. An asking price is never a sale price.**
+Every comp declares a `price_basis`. Only `verified_transaction` reaches a
+valuation. CLASSIC.COM's "Last Asking" figures, MarketCheck's Past Inventory
+removals and every dealer listing are stored, labelled and excluded. Every comp
+also declares a `permission_basis`; records with `unknown` are excluded, so the
+tool cannot quietly accumulate someone else's data.
+
+**3. No bypassing marketplace access restrictions.**
 Cars & Bids is registered as `prohibited` and is never fetched. Every HTTP
 request checks `robots.txt` first, uses one honest User-Agent, waits 5 seconds
 between requests to a host, and only reads JSON-LD that a site publishes
 deliberately. There is no login handling, no CAPTCHA handling and no proxy
 rotation anywhere in this repository.
 
-See **[DATA_SOURCES.md](DATA_SOURCES.md)** for the full source-by-source
-assessment: what has an API, what it costs, and what is off limits.
+See **[DATA_SOURCES.md](DATA_SOURCES.md)** for the source-by-source assessment,
+**[AUDIT.md](AUDIT.md)** for what is genuinely working versus merely written,
+and **[RUNBOOK.md](RUNBOOK.md)** for exact commands.
 
 ## Quick start
 
@@ -89,6 +103,10 @@ To see the dashboard layout before you have real data:
 | `override <id> [...]` | Record real per-car repair/transport/days quotes. Replaces placeholders. |
 | `vin <VIN>` | Decode via NHTSA vPIC (free, no key); offline checks if unreachable. |
 | `assumptions [--set K V]` | List or change every cost assumption. |
+| `validate [--listing-url U]` | Live real-data validation. The only thing that can mark a source live-verified. |
+| `acceptance <id> --destination XX` | Full underwriting report for one car, or INSUFFICIENT DATA with the exact gap. |
+| `classic-com init-config \| status` | CLASSIC.COM licensed adapter setup. |
+| `sheet --out FILE` | Export the mechanic cost input sheet (.html or .csv). |
 | `serve --destination XX` | Dashboard on 127.0.0.1:8000. |
 
 ## The money model
@@ -150,7 +168,7 @@ that tells you which cars are worth a phone call — not an appraisal.**
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v    # 49 tests
+python3 -m unittest discover -s tests -v    # 98 tests
 ```
 
 Covers the profit identity, the max-bid solve, mileage-adjustment direction and

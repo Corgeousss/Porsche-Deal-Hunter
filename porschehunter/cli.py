@@ -7,12 +7,16 @@ import json
 import sys
 from pathlib import Path
 
+from . import acceptance as _acceptance
 from . import comps as _comps
 from . import db as _db
 from . import deal as _deal
 from . import valuation as _valuation
 from . import vin as _vin
 from .assumptions import BY_KEY
+from . import sheets as _sheets
+from . import validate as _validate
+from .sources import classic_com as _classic
 from .sources import jsonld as _jsonld
 from .sources import manual as _manual
 from .sources import marketcheck as _marketcheck
@@ -54,8 +58,14 @@ def cmd_sources(args):
         print(f"[{flag:7}] {r['key']:22} {r['name']}  ({state})")
         print(f"          access: {r['access_method']}   cost: {r['cost_notes']}")
         print(f"          limits: {r['limitations']}")
+        lv = r["live_verified_at"]
         print(f"          last success: {r['last_success_at'] or 'never'}"
               f"   last attempt: {r['last_attempt_at'] or 'never'}")
+        if lv:
+            print(f"          LIVE-VERIFIED: {lv} -- {r['live_verified_note']}")
+        elif r["access_method"] in ("api", "rss", "jsonld"):
+            print("          LIVE-VERIFIED: NO -- this connector has never "
+                  "completed a real call to a real endpoint.")
         if r["last_error"]:
             print(f"          last error: {r['last_error'][:160]}")
         print()
@@ -136,12 +146,25 @@ def cmd_comps_add(args):
             body_style=args.body, transmission=args.transmission, mileage=args.mileage,
             sale_price=args.price, sale_date=args.date, venue=args.venue,
             source_url=args.url, vin=args.vin, condition_note=args.note,
-            includes_fees=args.includes_fees, recorded_by=args.by)
+            includes_fees=args.includes_fees, recorded_by=args.by,
+            price_basis=args.price_basis, permission_basis=args.permission_basis,
+            permission_note=args.permission_note)
     except _comps.CompRejected as exc:
         print(f"rejected: {exc}", file=sys.stderr)
         return 1
+    usable = (args.price_basis == _comps.USABLE_PRICE_BASIS
+              and args.permission_basis in _comps.USABLE_PERMISSION_BASES)
     print(f"Recorded comp #{cid}: {args.generation} {args.variant or ''} "
           f"{_money(float(args.price))} on {args.date}")
+    print(f"  price_basis={args.price_basis}  permission_basis={args.permission_basis}")
+    if usable:
+        print("  -> USABLE in valuations.")
+    else:
+        print("  -> NOT usable in valuations. " +
+              ("This is not a verified transaction price. "
+               if args.price_basis != _comps.USABLE_PRICE_BASIS else "") +
+              ("No permission basis recorded. "
+               if args.permission_basis not in _comps.USABLE_PERMISSION_BASES else ""))
     return 0
 
 
@@ -161,10 +184,20 @@ def cmd_comps_coverage(args):
         print("No comps recorded. Nothing can be valued until you add documented "
               "completed sales (`comps add` or `comps import`).")
         return 0
-    print(f"{'gen':8} {'variant':16} {'n':>4}  oldest      newest")
+    print(f"{'gen':8} {'variant':16} {'usable':>6} {'stored':>6} "
+          f"{'not-a-sale':>10} {'no-perm':>7}  oldest      newest")
+    tot_u = tot_s = 0
     for r in rows:
-        print(f"{r['generation']:8} {(r['variant'] or '-'):16} {r['n']:>4}  "
+        tot_u += r["n_usable"] or 0
+        tot_s += r["n_stored"] or 0
+        print(f"{r['generation']:8} {(r['variant'] or '-'):16} "
+              f"{r['n_usable'] or 0:>6} {r['n_stored']:>6} "
+              f"{r['n_not_a_sale'] or 0:>10} {r['n_no_permission'] or 0:>7}  "
               f"{r['oldest']}  {r['newest']}")
+    print(f"\n{tot_u} of {tot_s} stored comps are usable in valuations.")
+    if tot_s and not tot_u:
+        print("None are usable. A comp needs price_basis=verified_transaction AND "
+              "a permission_basis other than 'unknown'.")
     return 0
 
 
@@ -293,7 +326,13 @@ def cmd_status(args):
     print("\nsource access:")
     for r in conn.execute("SELECT * FROM sources ORDER BY key"):
         print(f"  {r['key']:22} enabled={bool(r['enabled'])!s:<5} "
+              f"live_verified={r['live_verified_at'] or 'NEVER':<26} "
               f"last_success={r['last_success_at'] or 'never'}")
+    n_lv = conn.execute(
+        "SELECT COUNT(*) c FROM sources WHERE live_verified_at IS NOT NULL").fetchone()["c"]
+    if n_lv == 0:
+        print("  -> No connector has completed a real endpoint call. "
+              "Run `validate` on a networked machine.")
     print("\nrecent runs:")
     for r in conn.execute("SELECT * FROM source_runs ORDER BY id DESC LIMIT 10"):
         print(f"  {r['started_at']} {r['source_key']:22} {r['status']:8} "
@@ -306,6 +345,65 @@ def cmd_status(args):
         for m in missing:
             print(f"  {m['field']:16} {m['c']}")
     return 0
+
+
+def cmd_validate(args):
+    conn = _conn(args)
+    _db.init_db(conn)
+    result = _validate.run(conn, listing_url=args.listing_url,
+                           destination_state=args.destination,
+                           allow_dirty=args.allow_dirty,
+                           skip_network=args.offline)
+    print(_validate.format_report(result, conn))
+    return 0 if result["counts"]["fail"] == 0 else 1
+
+
+def cmd_classic(args):
+    if args.classic_cmd == "init-config":
+        path = Path(args.path)
+        if path.exists() and not args.force:
+            print(f"{path} already exists. Use --force to overwrite.", file=sys.stderr)
+            return 1
+        _classic.write_template(path)
+        print(f"Wrote template to {path}")
+        print("Fill it in from https://support.classic.com/classic.com-api after "
+              "agreeing terms with datasupport@classic.com, then set "
+              '"confirmed": true.')
+        print(f"Also export {_classic.API_KEY_ENV}=<your licensed key>.")
+        return 0
+    pf = _classic.preflight(Path(args.path))
+    print(f"CLASSIC.COM adapter ready: {pf['ready']}")
+    print(f"  credential present: {pf['credential']}")
+    print(f"  endpoint config:    {pf['config']}")
+    for b in pf["blockers"]:
+        print(f"  BLOCKER: {b}")
+    return 0
+
+
+def cmd_sheet(args):
+    conn = _conn(args)
+    out = Path(args.out)
+    if out.suffix.lower() == ".csv":
+        _sheets.write_csv(conn, out)
+    else:
+        _sheets.write_html(conn, out)
+    rows = _sheets.build_rows(conn)
+    unver = sum(1 for r in rows if r["status"].startswith("UNVERIFIED"))
+    print(f"Wrote {out} ({len(rows)} cost lines, {unver} currently unverified "
+          f"placeholders).")
+    print("Send this to your mechanic. Feed answers back with "
+          "`assumptions --set <key> <value> --verified --basis \"...\"`.")
+    return 0
+
+
+def cmd_acceptance(args):
+    conn = _conn(args)
+    text, passed = _acceptance.report(conn, args.listing_id, args.destination)
+    print(text)
+    if args.out:
+        Path(args.out).write_text(text)
+        print(f"\nWritten to {args.out}")
+    return 0 if passed else 2
 
 
 def cmd_serve(args):
@@ -367,6 +465,16 @@ def build_parser():
     ca.add_argument("--note"); ca.add_argument("--by")
     ca.add_argument("--includes-fees", action="store_true",
                     help="set when the price already includes the buyer premium")
+    ca.add_argument("--price-basis", default="unknown", choices=sorted(_comps.PRICE_BASES),
+                    help="Is this a price someone actually paid? Only "
+                         "'verified_transaction' is usable in valuations. "
+                         "A removed listing's final ask is 'last_asking'.")
+    ca.add_argument("--permission-basis", default="unknown",
+                    choices=sorted(_comps.PERMISSION_BASES),
+                    help="On what basis may you use this record? 'unknown' is "
+                         "stored but excluded from valuations.")
+    ca.add_argument("--permission-note",
+                    help="required with --permission-basis operator_asserts_permission")
     ca.set_defaults(func=cmd_comps_add)
     ci = csub.add_parser("import"); ci.add_argument("path"); ci.set_defaults(func=cmd_comps_import)
     cc = csub.add_parser("coverage"); cc.set_defaults(func=cmd_comps_coverage)
@@ -399,6 +507,41 @@ def build_parser():
     asm.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"))
     asm.add_argument("--basis"); asm.add_argument("--verified", action="store_true")
     asm.set_defaults(func=cmd_assumptions)
+
+    va = sub.add_parser("validate",
+                        help="run the live real-data validation workflow")
+    va.add_argument("--listing-url", help="one real listing URL from an authorized, "
+                                          "allowlisted source to ingest end to end")
+    va.add_argument("--destination", default="OH", help=DEST_STATE_HELP)
+    va.add_argument("--allow-dirty", action="store_true",
+                    help="continue even if the database contains synthetic rows "
+                         "(results are then NOT production output)")
+    va.add_argument("--offline", action="store_true",
+                    help="skip all network steps and report them as skipped")
+    va.set_defaults(func=cmd_validate)
+
+    cm = sub.add_parser("classic-com", help="CLASSIC.COM licensed API adapter")
+    cmsub = cm.add_subparsers(dest="classic_cmd", required=True)
+    cmi = cmsub.add_parser("init-config")
+    cmi.add_argument("--path", default=str(_classic.CONFIG_PATH))
+    cmi.add_argument("--force", action="store_true")
+    cmi.set_defaults(func=cmd_classic)
+    cms = cmsub.add_parser("status")
+    cms.add_argument("--path", default=str(_classic.CONFIG_PATH))
+    cms.set_defaults(func=cmd_classic)
+
+    sh = sub.add_parser("sheet", help="export the mechanic cost input sheet")
+    sh.add_argument("--out", default="data/cost_input_sheet.html",
+                    help=".html for a printable one-pager, .csv to fill in digitally")
+    sh.set_defaults(func=cmd_sheet)
+
+    ac = sub.add_parser("acceptance",
+                        help="full underwriting report for one real listing, "
+                             "or INSUFFICIENT DATA with the exact gap")
+    ac.add_argument("listing_id", type=int)
+    ac.add_argument("--destination", required=True, help=DEST_STATE_HELP)
+    ac.add_argument("--out", help="also write the report to this file")
+    ac.set_defaults(func=cmd_acceptance)
 
     sv = sub.add_parser("serve", help="run the dashboard")
     sv.add_argument("--host", default="127.0.0.1"); sv.add_argument("--port", type=int, default=8000)

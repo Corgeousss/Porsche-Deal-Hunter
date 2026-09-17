@@ -78,6 +78,35 @@ DEFAULTS = [
         "location never looks cheaper than a known one.",
     ),
 
+    # --- Acquisition-side transaction costs ---------------------------------
+    # These apply on the BUY side and are easy to forget. Several are
+    # conditional: they only appear when the listing says they should.
+    Assumption(
+        "ppi_cost", 450.0, "USD",
+        "Placeholder pre-purchase inspection at an independent Porsche shop in "
+        "the seller's area. Applied to EVERY car -- buying a 911 sight-unseen "
+        "without a PPI is the single most expensive mistake available here.",
+    ),
+    Assumption(
+        "purchase_tax_pct", 0.0, "fraction of purchase price",
+        "Transaction/use tax on the PURCHASE. Defaults to 0, which assumes you "
+        "hold a dealer or resale exemption and are not registering the car for "
+        "road use. IF THAT IS NOT TRUE THIS IS WRONG AND MATERIAL: at a 6-7% "
+        "rate a $40,000 car carries $2,400-$2,800 of tax that this model is "
+        "not charging you. Confirm your position with your accountant and set "
+        "this explicitly either way.",
+    ),
+    Assumption(
+        "dealer_doc_fee", 500.0, "USD",
+        "Dealer documentation/processing fee, applied only when the seller is "
+        "a dealer. Caps vary widely by state. Placeholder.",
+    ),
+    Assumption(
+        "auction_buyer_premium_pct", 0.05, "fraction of hammer",
+        "Buyer premium you pay when the listing is an auction, applied only to "
+        "auction listings. Check the venue's published rate and any cap.",
+    ),
+
     # --- Selling costs ------------------------------------------------------
     Assumption(
         "sale_fee_pct", 0.05, "fraction of resale",

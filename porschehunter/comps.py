@@ -28,6 +28,38 @@ from . import vin as _vin
 VENUES = {"bring_a_trailer", "cars_and_bids", "classic_com", "pcarmarket",
           "dealer", "private", "auction_house", "marketcheck", "own_sale", "other"}
 
+# --- Is the number a price someone actually paid? --------------------------
+# Only VERIFIED_TRANSACTION is usable by the valuation engine. The other two
+# real-world cases exist because aggregators carry them and they are routinely
+# mistaken for sales:
+#   last_asking           -- CLASSIC.COM preserves a removed listing's final
+#                            asking price when no sold price was provided.
+#   inferred_from_removal -- a listing disappeared from dealer inventory. That
+#                            is a REMOVAL, not a transaction. It may have been
+#                            sold, withdrawn, traded or relisted elsewhere.
+PRICE_BASES = {
+    "verified_transaction": "A documented completed sale at a stated price.",
+    "last_asking": "Final asking price of a removed listing. NOT a sale price.",
+    "inferred_from_removal": "Listing was removed; a sale is INFERRED. NOT a sale price.",
+    "unknown": "Provenance not established.",
+}
+USABLE_PRICE_BASIS = "verified_transaction"
+
+# --- Are we permitted to hold and use this record? -------------------------
+# 'unknown' is excluded from the valuation engine. This is what stops the tool
+# from quietly accumulating a database of someone else's auction results.
+PERMISSION_BASES = {
+    "licensed_api": "Received under a data licence that permits this use.",
+    "own_transaction": "Your own purchase or sale.",
+    "seller_disclosed": "The counterparty told you directly.",
+    "public_record": "Government or other genuinely public record.",
+    "operator_asserts_permission": "You have confirmed you may use this record. "
+                                   "Record how in --permission-note.",
+    "unknown": "No basis established -- excluded from valuations.",
+}
+USABLE_PERMISSION_BASES = {"licensed_api", "own_transaction", "seller_disclosed",
+                           "public_record", "operator_asserts_permission"}
+
 
 class CompRejected(ValueError):
     pass
@@ -49,8 +81,15 @@ def add_comp(conn: sqlite3.Connection, *, generation: str, sale_price: float,
              body_style: str | None = None, vin: str | None = None,
              condition_note: str | None = None, includes_fees: bool = False,
              source_key: str | None = None, recorded_by: str | None = None,
+             price_basis: str = "unknown", permission_basis: str = "unknown",
+             permission_note: str | None = None,
              is_synthetic: bool = False) -> int:
-    """Record one documented completed sale. Raises CompRejected on bad input."""
+    """Record one completed sale. Raises CompRejected on bad input.
+
+    price_basis and permission_basis both default to 'unknown', which means the
+    row is stored but is NOT usable by the valuation engine. That default is
+    deliberate: a figure has to earn its way into a valuation.
+    """
     if not is_synthetic:
         if not str(source_url).lower().startswith(("http://", "https://")):
             raise CompRejected(
@@ -75,6 +114,17 @@ def add_comp(conn: sqlite3.Connection, *, generation: str, sale_price: float,
         )
     if venue not in VENUES:
         raise CompRejected(f"Unknown venue {venue!r}. Valid: {sorted(VENUES)}")
+    if price_basis not in PRICE_BASES:
+        raise CompRejected(
+            f"Unknown price_basis {price_basis!r}. Valid: {sorted(PRICE_BASES)}")
+    if permission_basis not in PERMISSION_BASES:
+        raise CompRejected(
+            f"Unknown permission_basis {permission_basis!r}. "
+            f"Valid: {sorted(PERMISSION_BASES)}")
+    if permission_basis == "operator_asserts_permission" and not permission_note:
+        raise CompRejected(
+            "operator_asserts_permission requires --permission-note describing "
+            "how you are permitted to use this record.")
 
     source_key = source_key or (venue if venue in
                                 {"bring_a_trailer", "cars_and_bids", "classic_com", "marketcheck"}
@@ -84,18 +134,23 @@ def add_comp(conn: sqlite3.Connection, *, generation: str, sale_price: float,
         """INSERT INTO comps (generation, variant, year, body_style, transmission,
                               mileage, sale_price, currency, sale_date, venue,
                               source_key, source_url, vin, condition_note,
-                              includes_fees, is_synthetic, recorded_at, recorded_by)
-           VALUES (?,?,?,?,?,?,?, 'USD', ?,?,?,?,?,?,?,?,?,?)
+                              includes_fees, price_basis, permission_basis,
+                              permission_note, is_synthetic, recorded_at, recorded_by)
+           VALUES (?,?,?,?,?,?,?, 'USD', ?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(source_url, vin, sale_date) DO UPDATE SET
                sale_price=excluded.sale_price, mileage=excluded.mileage,
-               condition_note=excluded.condition_note""",
+               condition_note=excluded.condition_note,
+               price_basis=excluded.price_basis,
+               permission_basis=excluded.permission_basis,
+               permission_note=excluded.permission_note""",
         (generation, _gens.normalize_variant(variant) or variant,
          int(year) if year else None,
          _gens.normalize_body_style(body_style) or body_style,
          _gens.normalize_transmission(transmission) or transmission,
          int(mileage) if mileage else None, sale_price, sale_date, venue,
          source_key, source_url, _vin.normalize(vin), condition_note,
-         int(includes_fees), int(is_synthetic), _db.utcnow(), recorded_by),
+         int(includes_fees), price_basis, permission_basis, permission_note,
+         int(is_synthetic), _db.utcnow(), recorded_by),
     )
     conn.commit()
     return int(cur.lastrowid)
@@ -103,7 +158,8 @@ def add_comp(conn: sqlite3.Connection, *, generation: str, sale_price: float,
 
 CSV_COLUMNS = ["generation", "variant", "year", "body_style", "transmission",
                "mileage", "sale_price", "sale_date", "venue", "source_url",
-               "vin", "condition_note", "includes_fees"]
+               "vin", "condition_note", "includes_fees",
+               "price_basis", "permission_basis", "permission_note"]
 
 
 def write_template(path: Path) -> None:
@@ -137,6 +193,9 @@ def import_csv(conn: sqlite3.Connection, path: Path,
                     condition_note=(row.get("condition_note") or "").strip() or None,
                     includes_fees=str(row.get("includes_fees", "")).strip().lower()
                                   in ("1", "true", "yes", "y"),
+                    price_basis=(row.get("price_basis") or "unknown").strip() or "unknown",
+                    permission_basis=(row.get("permission_basis") or "unknown").strip() or "unknown",
+                    permission_note=(row.get("permission_note") or "").strip() or None,
                     is_synthetic=allow_synthetic,
                 )
                 imported += 1
@@ -147,12 +206,26 @@ def import_csv(conn: sqlite3.Connection, path: Path,
     return imported, errors
 
 
+def usable_sql_clause(alias: str = "") -> str:
+    """The SQL predicate defining a comp the valuation engine may use."""
+    a = f"{alias}." if alias else ""
+    perms = ",".join(f"'{p}'" for p in sorted(USABLE_PERMISSION_BASES))
+    return (f"{a}price_basis = '{USABLE_PRICE_BASIS}' "
+            f"AND {a}permission_basis IN ({perms})")
+
+
 def coverage(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    """How many usable comps exist per generation -- the honest picture of
-    whether this platform can value anything yet."""
+    """Per generation: how many comps are stored, and how many are actually
+    usable. The gap between the two is the honest picture of what is blocking
+    this tool from valuing anything."""
     return conn.execute(
-        """SELECT generation, variant, COUNT(*) AS n,
-                  MIN(sale_date) AS oldest, MAX(sale_date) AS newest
-           FROM comps WHERE is_synthetic=0
-           GROUP BY generation, variant ORDER BY generation, n DESC"""
+        f"""SELECT generation, variant, COUNT(*) AS n_stored,
+                   SUM(CASE WHEN {usable_sql_clause()} THEN 1 ELSE 0 END) AS n_usable,
+                   SUM(CASE WHEN price_basis!='verified_transaction' THEN 1 ELSE 0 END)
+                       AS n_not_a_sale,
+                   SUM(CASE WHEN permission_basis='unknown' THEN 1 ELSE 0 END)
+                       AS n_no_permission,
+                   MIN(sale_date) AS oldest, MAX(sale_date) AS newest
+            FROM comps WHERE is_synthetic=0
+            GROUP BY generation, variant ORDER BY generation, n_usable DESC"""
     ).fetchall()

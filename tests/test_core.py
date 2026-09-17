@@ -27,12 +27,15 @@ def fresh_db():
 
 
 def add_synthetic_comp(conn, n, price, mileage, year=2008, variant="Carrera S",
-                       days_ago=30, venue="dealer"):
+                       days_ago=30, venue="dealer",
+                       price_basis="verified_transaction",
+                       permission_basis="own_transaction"):
     return comps.add_comp(
         conn, generation="997.1", variant=variant, year=year, body_style="coupe",
         transmission="manual", mileage=mileage, sale_price=price,
         sale_date=(TODAY - dt.timedelta(days=days_ago)).isoformat(),
         venue=venue, source_url=f"https://example.invalid/SYNTHETIC-TEST/{n}",
+        price_basis=price_basis, permission_basis=permission_basis,
         is_synthetic=True, condition_note="SYNTHETIC TEST ROW")
 
 
@@ -126,6 +129,109 @@ class TestCompGuards(unittest.TestCase):
         with_synth = valuation.value_listing(self.conn, row, today=TODAY, store=False,
                                              include_synthetic=True)
         self.assertEqual(with_synth["status"], "ok")
+
+
+class TestProvenanceGates(unittest.TestCase):
+    """A figure has to earn its way into a valuation."""
+
+    def setUp(self):
+        self.conn = fresh_db()
+        self.subject = {"id": None, "generation": "997.1", "year": 2008,
+                        "mileage": 50000, "variant": "Carrera S",
+                        "body_style": "coupe", "price": 40000}
+
+    def _value(self):
+        return valuation.value_listing(self.conn, self.subject, today=TODAY,
+                                       store=False, include_synthetic=True)
+
+    def test_last_asking_price_is_not_a_sale(self):
+        """CLASSIC.COM preserves a removed listing's final ASK when no sold
+        price was given. That must never be valued as a transaction."""
+        for i in range(8):
+            add_synthetic_comp(self.conn, i, 60000, 50000, price_basis="last_asking")
+        res = self._value()
+        self.assertEqual(res["status"], "insufficient_comps")
+        self.assertIn("INSUFFICIENT DATA", res["detail"]["explanation"])
+        self.assertIn("last_asking", res["detail"]["explanation"])
+
+    def test_inferred_dealer_sale_is_not_a_verified_price(self):
+        """A listing vanishing from dealer inventory is a removal, not a sale."""
+        for i in range(8):
+            add_synthetic_comp(self.conn, i, 60000, 50000,
+                               price_basis="inferred_from_removal")
+        res = self._value()
+        self.assertEqual(res["status"], "insufficient_comps")
+        self.assertEqual(res["n_comps"], 0)
+
+    def test_records_without_permission_basis_are_excluded(self):
+        for i in range(8):
+            add_synthetic_comp(self.conn, i, 60000, 50000, permission_basis="unknown")
+        res = self._value()
+        self.assertEqual(res["status"], "insufficient_comps")
+        self.assertIn("permission_basis=unknown", res["detail"]["explanation"])
+
+    def test_excluded_records_are_counted_and_explained(self):
+        for i in range(5):
+            add_synthetic_comp(self.conn, i, 60000, 50000, price_basis="last_asking")
+        for i in range(5, 8):
+            add_synthetic_comp(self.conn, i, 60000, 50000, permission_basis="unknown")
+        res = self._value()
+        self.assertEqual(res["detail"]["selection"]["excluded"]["total"], 8)
+
+    def test_mixed_set_uses_only_the_verified_permitted_ones(self):
+        for i in range(5):
+            add_synthetic_comp(self.conn, i, 60000, 50000)           # usable
+        for i in range(5, 12):
+            add_synthetic_comp(self.conn, i, 90000, 50000, price_basis="last_asking")
+        res = self._value()
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["n_comps"], 5)
+        self.assertEqual(res["point_value"], 60000.0)   # the 90k asks had no effect
+
+    def test_defaults_are_unusable(self):
+        """A comp added without declaring provenance is stored but not used."""
+        for i in range(8):
+            comps.add_comp(
+                self.conn, generation="997.1", variant="Carrera S", year=2008,
+                body_style="coupe", mileage=50000, sale_price=60000,
+                sale_date=(TODAY - dt.timedelta(days=30)).isoformat(),
+                venue="dealer", source_url=f"https://example.invalid/DEFAULTS/{i}",
+                is_synthetic=True)
+        self.assertEqual(self._value()["status"], "insufficient_comps")
+
+    def test_rejects_unknown_basis_values(self):
+        with self.assertRaises(comps.CompRejected):
+            comps.add_comp(self.conn, generation="997.1", sale_price=1,
+                           sale_date="2026-01-01", source_url="https://x.test/a",
+                           price_basis="probably_sold")
+        with self.assertRaises(comps.CompRejected):
+            comps.add_comp(self.conn, generation="997.1", sale_price=1,
+                           sale_date="2026-01-01", source_url="https://x.test/a",
+                           permission_basis="i_found_it")
+
+    def test_asserted_permission_requires_a_note(self):
+        with self.assertRaises(comps.CompRejected):
+            comps.add_comp(self.conn, generation="997.1", sale_price=1,
+                           sale_date="2026-01-01", source_url="https://x.test/a",
+                           permission_basis="operator_asserts_permission")
+        cid = comps.add_comp(
+            self.conn, generation="997.1", sale_price=1, sale_date="2026-01-01",
+            source_url="https://x.test/a",
+            permission_basis="operator_asserts_permission",
+            permission_note="Written permission from the auction house, 2026-09-01.")
+        self.assertIsInstance(cid, int)
+
+    def test_coverage_separates_stored_from_usable(self):
+        add_synthetic_comp(self.conn, 1, 60000, 50000)
+        add_synthetic_comp(self.conn, 2, 60000, 50000, price_basis="last_asking")
+        add_synthetic_comp(self.conn, 3, 60000, 50000, permission_basis="unknown")
+        conn2 = self.conn
+        row = conn2.execute(
+            f"""SELECT COUNT(*) AS stored,
+                SUM(CASE WHEN {comps.usable_sql_clause()} THEN 1 ELSE 0 END) AS usable
+                FROM comps""").fetchone()
+        self.assertEqual(row["stored"], 3)
+        self.assertEqual(row["usable"], 1)
 
 
 class TestValuation(unittest.TestCase):
@@ -327,6 +433,85 @@ class TestOverrides(unittest.TestCase):
                           include_synthetic=True, repairs_override=999)
         lines = {l["key"]: l for l in r["detail"]["cost_lines"]}
         self.assertEqual(lines["repairs"]["amount"], 999)
+
+
+class TestTransactionCosts(unittest.TestCase):
+    """Taxes, dealer fees, auction premiums and the PPI."""
+
+    def setUp(self):
+        self.conn = fresh_db()
+        for i in range(8):
+            add_synthetic_comp(self.conn, i, 60000, 50000)
+        self.base = {"id": None, "generation": "997.1", "year": 2008,
+                     "mileage": 50000, "variant": "Carrera S", "body_style": "coupe",
+                     "price": 40000, "seller_state": "CA"}
+
+    def _eval(self, **over):
+        return deal.evaluate(self.conn, {**self.base, **over}, destination_state="OH",
+                             store=False, include_synthetic=True)
+
+    def test_ppi_is_always_charged(self):
+        lines = {l["key"]: l for l in self._eval()["detail"]["cost_lines"]}
+        self.assertIn("ppi_cost", lines)
+        self.assertGreater(lines["ppi_cost"]["amount"], 0)
+
+    def test_dealer_doc_fee_only_for_dealers(self):
+        private = {l["key"] for l in self._eval(seller_type="private")["detail"]["cost_lines"]}
+        dealer = {l["key"] for l in self._eval(seller_type="dealer")["detail"]["cost_lines"]}
+        self.assertNotIn("dealer_doc_fee", private)
+        self.assertIn("dealer_doc_fee", dealer)
+
+    def test_unknown_seller_type_says_so(self):
+        text = " ".join(self._eval(seller_type=None)["detail"]["explanation"])
+        self.assertIn("Seller type is unknown", text)
+
+    def test_auction_premium_only_for_auctions(self):
+        fixed = self._eval(listing_type="fixed")
+        auction = self._eval(listing_type="auction")
+        self.assertEqual(fixed["detail"]["auction_buyer_premium_pct"], 0.0)
+        self.assertGreater(auction["detail"]["auction_buyer_premium_pct"], 0)
+        self.assertLess(auction["net_profit"], fixed["net_profit"])
+
+    def test_purchase_tax_reduces_profit_and_max_bid(self):
+        before = self._eval()
+        db.set_assumption(self.conn, "purchase_tax_pct", 0.0625,
+                          basis="test state rate", verified=True)
+        after = self._eval()
+        self.assertAlmostEqual(before["net_profit"] - after["net_profit"],
+                               40000 * 0.0625, places=2)
+        self.assertLess(after["max_purchase_price"], before["max_purchase_price"])
+
+    def test_zero_tax_is_flagged_not_silent(self):
+        text = " ".join(self._eval()["detail"]["explanation"])
+        self.assertIn("resale/dealer exemption", text)
+
+    def test_max_bid_identity_holds_with_tax_and_auction(self):
+        """P_max must still yield exactly the target once tax and an auction
+        premium are in play -- this is the whole point of the solve."""
+        db.set_assumption(self.conn, "purchase_tax_pct", 0.0625)
+        r = self._eval(listing_type="auction", seller_type="dealer")
+        at_max = self._eval(listing_type="auction", seller_type="dealer",
+                            price=r["max_purchase_price"])
+        # max_purchase_price is rounded to the cent before being re-fed, so a
+        # sub-cent residual is expected and harmless.
+        self.assertAlmostEqual(at_max["net_profit"],
+                               db.get_assumption(self.conn, "target_net_profit"),
+                               delta=0.05)
+
+    def test_total_cost_identity_with_all_rates(self):
+        db.set_assumption(self.conn, "purchase_tax_pct", 0.0625)
+        r = self._eval(listing_type="auction", seller_type="dealer")
+        fixed = sum(l["amount"] for l in r["detail"]["cost_lines"])
+        rates = sum(rl["amount"] for rl in r["detail"]["rate_lines"])
+        self.assertAlmostEqual(r["total_cost"], r["asking_price"] + fixed + rates,
+                               places=2)
+        self.assertAlmostEqual(r["net_profit"], r["expected_resale"] - r["total_cost"],
+                               places=2)
+
+    def test_applied_rates_appear_in_unverified_list(self):
+        db.set_assumption(self.conn, "purchase_tax_pct", 0.0625)
+        r = self._eval(listing_type="auction")
+        self.assertIn("auction_buyer_premium", r["detail"]["unverified_lines"])
 
 
 class TestManualEntry(unittest.TestCase):

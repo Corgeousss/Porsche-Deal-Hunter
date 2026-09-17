@@ -19,7 +19,12 @@ CREATE TABLE IF NOT EXISTS sources (
     enabled              INTEGER NOT NULL DEFAULT 0,
     last_success_at      TEXT,
     last_attempt_at      TEXT,
-    last_error           TEXT
+    last_error           TEXT,
+
+    -- Proof that a real call to a real endpoint succeeded. Set ONLY by a
+    -- successful live validation run -- never by a unit test, never by hand.
+    live_verified_at     TEXT,
+    live_verified_note   TEXT
 );
 
 -- One row per ingestion attempt, so "when did we last see this source" is always answerable.
@@ -152,6 +157,22 @@ CREATE TABLE IF NOT EXISTS comps (
     vin            TEXT,
     condition_note TEXT,
     includes_fees  INTEGER NOT NULL DEFAULT 0,  -- 1 if sale_price already includes buyer premium
+
+    -- Is this figure a price a buyer actually paid, or an inference?
+    -- verified_transaction  -- a documented completed sale at a stated price
+    -- last_asking           -- final asking price of a removed listing. NOT a sale.
+    -- inferred_from_removal -- listing vanished; a sale is INFERRED. NOT a sale price.
+    -- unknown               -- provenance not established
+    -- Only 'verified_transaction' is usable by the valuation engine.
+    price_basis    TEXT NOT NULL DEFAULT 'unknown',
+
+    -- On what basis are we permitted to hold and use this record?
+    -- licensed_api | own_transaction | seller_disclosed | public_record
+    -- | operator_asserts_permission | unknown
+    -- 'unknown' is excluded from the valuation engine.
+    permission_basis TEXT NOT NULL DEFAULT 'unknown',
+    permission_note  TEXT,
+
     is_synthetic   INTEGER NOT NULL DEFAULT 0,
     recorded_at    TEXT NOT NULL,
     recorded_by    TEXT,
@@ -217,3 +238,31 @@ CREATE TABLE IF NOT EXISTS listing_overrides (
     note         TEXT,
     updated_at   TEXT NOT NULL
 );
+
+-- ---------------------------------------------------------------------------
+-- Live validation runs: the evidence trail for "does this actually work".
+-- One row per check, recording the endpoint called and what came back.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS validation_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at  TEXT NOT NULL,
+    finished_at TEXT,
+    profile     TEXT NOT NULL,     -- which workflow was run
+    passed      INTEGER NOT NULL DEFAULT 0,
+    failed      INTEGER NOT NULL DEFAULT 0,
+    skipped     INTEGER NOT NULL DEFAULT 0,
+    summary     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS validation_steps (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        INTEGER NOT NULL REFERENCES validation_runs(id) ON DELETE CASCADE,
+    step          TEXT NOT NULL,
+    status        TEXT NOT NULL,   -- pass | fail | skip
+    endpoint      TEXT,            -- the exact URL called, if any
+    retrieved_at  TEXT,            -- when the response came back
+    http_status   INTEGER,
+    detail        TEXT,
+    started_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_validation_steps_run ON validation_steps(run_id);

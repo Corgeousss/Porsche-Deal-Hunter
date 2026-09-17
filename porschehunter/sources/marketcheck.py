@@ -1,13 +1,37 @@
 """MarketCheck Automotive API client.
 
-MarketCheck is a commercial vehicle-listings API. It is the one source in this
-project that gives broad, authorized, automated access to live dealer
-inventory nationwide -- and it is paid. Set MARKETCHECK_API_KEY to enable it.
+MarketCheck is a commercial vehicle-listings API covering dealer, private-party
+and auction inventory, plus historical/past inventory. Documented at
+https://docs.marketcheck.com/docs/api/cars. Paid; set MARKETCHECK_API_KEY.
 
-Endpoint paths and parameter names follow MarketCheck's published v2 Cars API
-shape. CONFIRM THEM AGAINST YOUR OWN PLAN'S DOCUMENTATION before relying on
-this in production: the exact host, path and entitlements depend on the
-contract you sign, and this file was written without access to a live key.
+ENDPOINT COVERAGE (per MarketCheck's published Cars API docs)
+-------------------------------------------------------------
+  active dealer listings   /v2/search/car/active
+  private-party listings   Private Party Inventory Search
+  auction listings         Auction Inventory Search
+  past/sold inventory      Past Inventory Search -- DEALER ONLY, US/CA.
+                           Does NOT cover private party or auction listings.
+  VIN history              listing history by VIN: past listings, price
+                           changes, mileage changes, seller information
+  VIN decode               /v2/decode/car/neovin/{vin}/specs
+  price prediction         /v2/predict/car/us/marketcheck_price/comparables
+
+THE PAST-INVENTORY TRAP -- READ BEFORE USING IT FOR COMPS
+----------------------------------------------------------
+"Past Inventory" contains sold vehicles, EXPIRED listings and vehicles REMOVED
+from active inventory. A listing leaving a dealer's feed is a removal, not a
+transaction: the car may have been sold, withdrawn, traded, or relisted
+elsewhere, and the last price seen is the last ASKING price, not a sale price.
+
+This client therefore imports past-inventory records with
+price_basis='inferred_from_removal', which the valuation engine excludes. Only
+promote a record to 'verified_transaction' if your licence gives you an actual
+transaction price and you have confirmed which field carries it.
+
+CONFIRM AGAINST YOUR OWN PLAN before relying on any of this: exact paths,
+parameter names and entitlements depend on the contract you sign, and this file
+was written WITHOUT access to a live key -- no call here has ever been executed
+against the real API.
 """
 
 from __future__ import annotations
@@ -23,7 +47,25 @@ from .. import generations as _gens
 from .. import vin as _vin
 from .base import IngestResult
 
-BASE_URL = os.environ.get("MARKETCHECK_BASE_URL", "https://mc-api.marketcheck.com/v2")
+# MarketCheck's documented host. Override if your plan is issued a different one.
+BASE_URL = os.environ.get("MARKETCHECK_BASE_URL", "https://api.marketcheck.com/v2")
+
+# Logical operation -> documented path. Paths that MarketCheck documents by
+# name rather than by literal URL are left as None so this client cannot
+# silently call a guessed endpoint.
+ENDPOINTS = {
+    "active": "search/car/active",
+    "private_party": None,   # "Private Party Inventory Search" -- confirm path
+    "auction": None,         # "Auction Inventory Search"       -- confirm path
+    "past": None,            # "Past Inventory Search"          -- confirm path
+    "vin_history": None,     # "History by VIN"                 -- confirm path
+    "vin_decode": "decode/car/neovin/{vin}/specs",
+}
+
+
+class EndpointNotConfirmed(RuntimeError):
+    """Raised for an endpoint MarketCheck documents but whose exact path this
+    client has not had confirmed against a live plan."""
 API_KEY_ENV = "MARKETCHECK_API_KEY"
 
 
@@ -58,8 +100,22 @@ def _get(path: str, params: dict, timeout: int = 30) -> dict:
         raise RuntimeError(f"MarketCheck HTTP {exc.code}: {body}") from exc
 
 
+def _endpoint(kind: str) -> str:
+    path = ENDPOINTS.get(kind)
+    if not path:
+        raise EndpointNotConfirmed(
+            f"MarketCheck documents a '{kind}' endpoint, but its exact path is "
+            f"not confirmed in this client. Look it up at "
+            f"https://docs.marketcheck.com/docs/api/cars, set "
+            f"ENDPOINTS['{kind}'], and verify against your plan's entitlements. "
+            f"This client will not call a guessed path."
+        )
+    return path
+
+
 def search_911(year_min: int | None = None, year_max: int | None = None,
-               rows: int = 50, start: int = 0, **extra) -> dict:
+               rows: int = 50, start: int = 0, kind: str = "active", **extra) -> dict:
+    """Search 911s. `kind` selects active / private_party / auction / past."""
     params = {
         "make": "Porsche",
         "model": "911",
@@ -72,7 +128,13 @@ def search_911(year_min: int | None = None, year_max: int | None = None,
         params["year_min"] = year_min
     if year_max:
         params["year_max"] = year_max
-    return _get("search/car/active", params)
+    return _get(_endpoint(kind), params)
+
+
+# Past-inventory records are removals, not transactions. See the module
+# docstring. This is the basis they are stored under, and it is excluded from
+# every valuation until you can prove an actual transaction price.
+PAST_INVENTORY_PRICE_BASIS = "inferred_from_removal"
 
 
 def to_record(item: dict) -> dict:
@@ -116,18 +178,21 @@ def to_record(item: dict) -> dict:
 
 
 def ingest(conn, year_min: int | None = None, year_max: int | None = None,
-           max_rows: int = 100, decode_vins: bool = False) -> IngestResult:
+           max_rows: int = 100, decode_vins: bool = False,
+           kind: str = "active") -> IngestResult:
     res = IngestResult(source_key="marketcheck")
     try:
         api_key()
-    except NotConfigured as exc:
+        _endpoint(kind)
+    except (NotConfigured, EndpointNotConfirmed) as exc:
         res.status = "skipped"
         res.message = str(exc)
         return res
 
     start, page = 0, 50
     while start < max_rows:
-        payload = search_911(year_min, year_max, rows=min(page, max_rows - start), start=start)
+        payload = search_911(year_min, year_max, rows=min(page, max_rows - start),
+                             start=start, kind=kind)
         items = payload.get("listings") or []
         if not items:
             break
@@ -146,5 +211,5 @@ def ingest(conn, year_min: int | None = None, year_max: int | None = None,
             res.updated += int(not created)
             res.listing_ids.append(listing_id)
         start += len(items)
-    res.message = f"fetched {res.seen} listings from MarketCheck"
+    res.message = f"fetched {res.seen} '{kind}' listings from MarketCheck"
     return res
