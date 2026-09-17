@@ -1,0 +1,9 @@
+# Dealer domains approved for schema.org JSON-LD reading.
+# One domain per line. Subdomains are matched automatically.
+#
+# Add a domain ONLY after you have read that site's terms of use.
+# robots.txt is checked on every request regardless of what is listed here.
+# Empty by default -- nothing is fetched until you opt a domain in.
+#
+# example:
+# someporschedealer.com

@@ -1,0 +1,10 @@
+# RSS saved-search feeds.  Format:  <source_key> <feed_url>
+#
+# Craigslist publishes RSS on search-result pages, and its terms endorse RSS
+# readers while prohibiting scrapers and bulk harvesting. Read
+# https://www.craigslist.org/about/terms.of.use/en and decide for yourself
+# whether your use fits. This connector is disabled by default:
+#   python3 -m porschehunter enable craigslist_rss
+#
+# example:
+# craigslist_rss https://sfbay.craigslist.org/search/cto?query=porsche+911&format=rss
