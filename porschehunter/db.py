@@ -229,6 +229,27 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE sources ADD COLUMN live_verified_at TEXT")
         if "live_verified_note" not in have:
             conn.execute("ALTER TABLE sources ADD COLUMN live_verified_note TEXT")
+    if "listings" in existing:
+        have = cols("listings")
+        # Columns added for the filter/pipeline/condition work. All nullable so
+        # existing rows migrate cleanly and read as UNKNOWN until set.
+        for col, decl in [
+            ("listing_date", "TEXT"),
+            ("deal_stage", "TEXT"),
+            ("stage_updated_at", "TEXT"),
+            ("title_status", "TEXT"),
+            ("accident_history", "TEXT"),
+            ("owners_count", "INTEGER"),
+            ("service_records", "TEXT"),
+            ("recent_major_service", "TEXT"),
+            ("known_issues", "TEXT"),
+            ("cosmetic_condition", "TEXT"),
+            ("ppi_done", "TEXT"),
+            ("seller_docs", "TEXT"),
+            ("original_status", "TEXT"),
+        ]:
+            if col not in have:
+                conn.execute(f"ALTER TABLE listings ADD COLUMN {col} {decl}")
     conn.commit()
 
 
@@ -355,7 +376,7 @@ LISTING_FIELDS = (
     "body_style transmission drivetrain engine exterior_color interior_color "
     "mileage mileage_unit vin price currency listing_type auction_ends_at "
     "seller_type seller_name seller_city seller_state seller_zip status "
-    "data_source_note notes"
+    "listing_date data_source_note notes"
 ).split()
 
 # Fields whose absence materially weakens a valuation.

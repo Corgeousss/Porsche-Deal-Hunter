@@ -79,12 +79,28 @@ CREATE TABLE IF NOT EXISTS listings (
     seller_zip        TEXT,
 
     status            TEXT NOT NULL DEFAULT 'active',  -- active | sold | removed | stale
+    listing_date      TEXT,              -- when the source first listed it, if known
     first_seen_at     TEXT NOT NULL,
     last_seen_at      TEXT NOT NULL,
     fetched_at        TEXT NOT NULL,     -- refresh timestamp of the most recent read
     data_source_note  TEXT,              -- e.g. "operator-entered from listing page"
     raw               TEXT,              -- raw payload as JSON, for auditing
-    notes             TEXT
+    notes             TEXT,
+
+    -- Operator-managed acquisition pipeline + condition/history (Tasks 2D, 2G).
+    -- All default NULL = UNKNOWN. Missing is never read as a verified negative.
+    deal_stage        TEXT,              -- needs_inspection | contacted_seller | ... | sold
+    stage_updated_at  TEXT,
+    title_status      TEXT,              -- clean | salvage | rebuilt  (NULL = unknown)
+    accident_history  TEXT,              -- none | reported          (NULL = unknown)
+    owners_count      INTEGER,
+    service_records   TEXT,              -- yes | no                 (NULL = unknown)
+    recent_major_service TEXT,           -- yes | no                 (NULL = unknown)
+    known_issues      TEXT,              -- free text, operator-entered
+    cosmetic_condition TEXT,             -- free text, operator-entered
+    ppi_done          TEXT,              -- yes | no                 (NULL = unknown)
+    seller_docs       TEXT,              -- yes | no                 (NULL = unknown)
+    original_status   TEXT               -- original | modified     (NULL = unknown)
 );
 CREATE INDEX IF NOT EXISTS idx_listings_gen ON listings(generation, status);
 CREATE INDEX IF NOT EXISTS idx_listings_vin ON listings(vin);
@@ -271,3 +287,66 @@ CREATE TABLE IF NOT EXISTS validation_steps (
     started_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_validation_steps_run ON validation_steps(run_id);
+
+-- ---------------------------------------------------------------------------
+-- Confirmed factory options / features, per listing. Populated ONLY from
+-- structured, confirmed data (e.g. JSON-LD additionalProperty) -- never guessed
+-- from a free-text description. A car with no row for a feature is UNKNOWN for
+-- that feature, which is different from "does not have it".
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS listing_features (
+    listing_id  INTEGER NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+    feature_key TEXT NOT NULL,     -- sport_chrono | sport_exhaust | ccb | sport_seats | ...
+    present     INTEGER NOT NULL,  -- 1 confirmed present, 0 confirmed absent
+    provenance  TEXT NOT NULL,     -- where the confirmation came from
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (listing_id, feature_key)
+);
+
+-- ---------------------------------------------------------------------------
+-- Saved searches (Task 3). filters is the JSON filter object; notify is the
+-- JSON set of alert criteria the operator chose for this search.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS saved_searches (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    filters     TEXT NOT NULL DEFAULT '{}',
+    sort        TEXT,
+    notify      TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    last_run_at TEXT
+);
+
+-- In-app notification feed (Task 3). dedup_key makes a repeated alert for the
+-- same unchanged fact a no-op, so the operator is not spammed.
+CREATE TABLE IF NOT EXISTS notifications (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    search_id  INTEGER REFERENCES saved_searches(id) ON DELETE SET NULL,
+    search_name TEXT,
+    listing_id INTEGER REFERENCES listings(id) ON DELETE CASCADE,
+    kind       TEXT NOT NULL,     -- new_match | price_drop | below_threshold | auction_soon | meets_profit
+    title      TEXT NOT NULL,
+    body       TEXT,
+    dedup_key  TEXT NOT NULL UNIQUE,
+    read       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- Reconditioning cost workflow (Task 6). One row per (listing, category).
+-- Every number carries whether it is an estimate, a written quote, or a paid
+-- invoice, so the underwriting can tell a guess from a committed cost.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS recon_costs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    listing_id  INTEGER NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+    category    TEXT NOT NULL,   -- ppi | engine_mechanical | transmission | tires_brakes | ...
+    amount      REAL NOT NULL,
+    basis       TEXT NOT NULL DEFAULT 'estimate',  -- estimate | quote | invoice
+    note        TEXT,
+    updated_at  TEXT NOT NULL,
+    UNIQUE(listing_id, category)
+);
+CREATE INDEX IF NOT EXISTS idx_recon_listing ON recon_costs(listing_id);

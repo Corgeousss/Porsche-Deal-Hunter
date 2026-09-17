@@ -16,6 +16,8 @@ from . import vin as _vin
 from .assumptions import BY_KEY
 from . import sheets as _sheets
 from . import validate as _validate
+from . import searches as _searches
+from . import recon as _recon
 from .sources import classic_com as _classic
 from .sources import jsonld as _jsonld
 from .sources import manual as _manual
@@ -551,6 +553,68 @@ def cmd_marketcheck(args):
     return 0
 
 
+def cmd_alerts(args):
+    conn = _conn(args)
+    if args.alerts_cmd == "run":
+        res = _searches.run_alerts(conn, destination_state=args.destination)
+        print(f"Alerts recomputed for {res['searches_evaluated']} saved search(es); "
+              f"{res['created']} new notification(s).")
+        for name, n in res["per_search"].items():
+            print(f"  {name}: {n}")
+        print("\nNote: alerts only update when this runs. Nothing polls in the "
+              "background.")
+        return 0
+    # list
+    unread = _searches.unread_count(conn)
+    items = _searches.list_notifications(conn, unread_only=args.unread, limit=args.limit)
+    print(f"{unread} unread notification(s).")
+    for n in items:
+        flag = " " if n["read"] else "*"
+        print(f" {flag} [{n['kind']}] {n['title']}  ({n['created_at']})")
+        if n["body"]:
+            print(f"      {n['body']}")
+    return 0
+
+
+def cmd_searches(args):
+    conn = _conn(args)
+    rows = _searches.list_searches(conn)
+    if not rows:
+        print("No saved searches. Create them in the dashboard (Save search).")
+        return 0
+    for s in rows:
+        alerts = ", ".join(k for k, v in (s["notify"] or {}).items() if v) or "none"
+        print(f"#{s['id']}  {s['name']}")
+        print(f"      filters: {json.dumps(s['filters'])}")
+        print(f"      sort: {s['sort'] or 'newest'}   alerts: {alerts}   "
+              f"last run: {s['last_run_at'] or 'never'}")
+    return 0
+
+
+def cmd_recon(args):
+    conn = _conn(args)
+    if args.amount is not None:
+        if not args.category:
+            print("--category is required when --amount is given", file=sys.stderr)
+            return 1
+        try:
+            _recon.set_cost(conn, args.listing_id, args.category, args.amount,
+                            basis=args.basis, note=args.note)
+        except _recon.ReconError as exc:
+            print(f"rejected: {exc}", file=sys.stderr)
+            return 1
+    summ = _recon.summary(conn, args.listing_id)
+    print(f"Reconditioning for listing #{args.listing_id}: total {_money(summ['total'])} "
+          f"({summ['weakest_basis'] or 'no lines yet'})")
+    for line in summ["lines"]:
+        print(f"  {line['category']:18} {_money(line['amount'])}  [{line['basis']}]"
+              + (f"  {line['note']}" if line["note"] else ""))
+    if not summ["lines"]:
+        print("  (none recorded -- enter them in the dashboard Recon form, or with "
+              "`recon <id> --category <k> --amount <n> --basis quote`)")
+    return 0
+
+
 def cmd_serve(args):
     from . import dashboard
     dashboard.serve(args.db, host=args.host, port=args.port,
@@ -712,6 +776,27 @@ def build_parser():
     ac.add_argument("--destination", required=True, help=DEST_STATE_HELP)
     ac.add_argument("--out", help="also write the report to this file")
     ac.set_defaults(func=cmd_acceptance)
+
+    al = sub.add_parser("alerts", help="recompute or list saved-search notifications")
+    alsub = al.add_subparsers(dest="alerts_cmd", required=True)
+    alr = alsub.add_parser("run", help="recompute alerts for all saved searches (manual; no polling)")
+    alr.add_argument("--destination", default="OH", help=DEST_STATE_HELP)
+    alr.set_defaults(func=cmd_alerts)
+    all_ = alsub.add_parser("list", help="show the notification feed")
+    all_.add_argument("--unread", action="store_true")
+    all_.add_argument("--limit", type=int, default=50)
+    all_.set_defaults(func=cmd_alerts)
+
+    ss = sub.add_parser("searches", help="list saved searches")
+    ss.set_defaults(func=cmd_searches)
+
+    rc = sub.add_parser("recon", help="record/show reconditioning cost estimates for a car")
+    rc.add_argument("listing_id", type=int)
+    rc.add_argument("--category", choices=sorted(_recon.CATEGORY_KEYS))
+    rc.add_argument("--amount", type=float)
+    rc.add_argument("--basis", default="estimate", choices=list(_recon.BASES))
+    rc.add_argument("--note")
+    rc.set_defaults(func=cmd_recon)
 
     sv = sub.add_parser("serve", help="run the dashboard")
     sv.add_argument("--host", default="127.0.0.1"); sv.add_argument("--port", type=int, default=8000)

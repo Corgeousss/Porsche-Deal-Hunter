@@ -413,14 +413,15 @@ def _store(conn, listing_id, valuation_id, out: dict) -> None:
 
 def evaluate_all(conn: sqlite3.Connection, destination_state: str,
                  only_active: bool = True,
-                 include_synthetic: bool = False) -> list[dict]:
+                 include_synthetic: bool = False,
+                 store: bool = True) -> list[dict]:
     sql = "SELECT * FROM listings"
     if only_active:
         sql += " WHERE status='active'"
     results = []
     for row in conn.execute(sql).fetchall():
         res = evaluate(conn, row, destination_state=destination_state,
-                       include_synthetic=include_synthetic)
+                       include_synthetic=include_synthetic, store=store)
         res["listing"] = dict(row)
         results.append(res)
     return results
