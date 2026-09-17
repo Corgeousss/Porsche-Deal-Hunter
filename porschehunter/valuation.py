@@ -28,8 +28,14 @@ import statistics
 from . import comps as _comps
 from . import db as _db
 from . import generations as _gens
+from . import taxonomy as _tax
 
 MIN_REQUIRED_FIELDS = ("generation", "year", "mileage")
+
+# Material-mismatch guard (method, not a market assumption): after adjustment,
+# a comp more than this fraction away from the median is treated as a different
+# car and dropped with a recorded reason.
+MATERIAL_MISMATCH_FRACTION = 0.60
 
 
 def _age_days(sale_date: str, today: _dt.date) -> int:
@@ -57,10 +63,13 @@ def select_comps(conn: sqlite3.Connection, subject: dict,
     mileage = subject.get("mileage")
     variant = subject.get("variant")
     body = subject.get("body_style")
+    transmission = subject.get("transmission")
+    tier_vars = _tax.tier_variants(variant)
 
     steps = []
 
-    def query(gen_list, use_variant, use_body, use_mileage, use_year):
+    def query(gen_list, *, use_variant=False, use_tier=False, use_body=False,
+              use_trans=False, use_mileage=False, use_year=False):
         synth_clause = "" if include_synthetic else " AND is_synthetic=0"
         # Only verified transactions we are permitted to use ever reach a
         # valuation. Asking prices and inferred sales are stored but excluded.
@@ -71,9 +80,18 @@ def select_comps(conn: sqlite3.Connection, subject: dict,
         if use_variant and variant:
             sql.append("AND variant=?")
             args.append(variant)
+        # Same-tier fallback: never cross a performance tier (base/S/GTS/Turbo/GT).
+        if use_tier and tier_vars:
+            sql.append(f"AND variant IN ({','.join('?' * len(tier_vars))})")
+            args += tier_vars
         if use_body and body:
             sql.append("AND (body_style=? OR body_style IS NULL)")
             args.append(body)
+        # Transmission is material on a 911 (manual vs PDK/Tiptronic). Match it
+        # when known; comps with unknown transmission are allowed through.
+        if use_trans and transmission:
+            sql.append("AND (transmission=? OR transmission IS NULL)")
+            args.append(transmission)
         if use_mileage and mileage:
             sql.append("AND (mileage IS NULL OR ABS(mileage-?)<=?)")
             args += [mileage, mileage_window]
@@ -82,22 +100,35 @@ def select_comps(conn: sqlite3.Connection, subject: dict,
             args += [year, year_window]
         return conn.execute(" ".join(sql), args).fetchall()
 
+    # Ladder from strictest to loosest. Variant is only ever dropped as far as
+    # the same performance tier -- never to "any variant".
     ladder = [
-        ("exact generation + variant + body + mileage band + year band", gens, True, True, True, True),
-        ("exact generation + variant + mileage band + year band", gens, True, False, True, True),
-        ("exact generation + variant + year band", gens, True, False, False, True),
-        ("generation family + variant", family_gens, True, False, False, False),
-        ("generation family, any variant", family_gens, False, False, False, False),
+        ("exact generation + variant + transmission + body + mileage band + year band",
+         dict(gen_list=gens, use_variant=True, use_trans=True, use_body=True, use_mileage=True, use_year=True)),
+        ("exact generation + variant + transmission + mileage band + year band",
+         dict(gen_list=gens, use_variant=True, use_trans=True, use_mileage=True, use_year=True)),
+        ("exact generation + variant + mileage band + year band",
+         dict(gen_list=gens, use_variant=True, use_mileage=True, use_year=True)),
+        ("exact generation + variant + year band",
+         dict(gen_list=gens, use_variant=True, use_year=True)),
+        ("generation family + variant",
+         dict(gen_list=family_gens, use_variant=True)),
+        ("generation family + same performance tier",
+         dict(gen_list=family_gens, use_tier=True)),
     ]
-    for label, gl, uv, ub, um, uy in ladder:
-        rows = query(gl, uv, ub, um, uy)
+    exact_variant_labels = {lbl for lbl, kw in ladder if kw.get("use_variant")}
+    for label, kw in ladder:
+        rows = query(**kw)
         steps.append({"filter": label, "matched": len(rows)})
         if len(rows) >= min_needed:
             return rows, {"steps": steps, "used": label,
-                          "widened": label != ladder[0][0]}
-    # Nothing met the bar; return the widest set so the caller can explain.
-    rows = query(family_gens, False, False, False, False)
-    return rows, {"steps": steps, "used": None, "widened": True}
+                          "widened": label != ladder[0][0],
+                          "variant_exact": label in exact_variant_labels,
+                          "tier_only": kw.get("use_tier", False)}
+    # Nothing met the bar; return the widest same-tier set so the caller can explain.
+    rows = query(gen_list=family_gens, use_tier=True)
+    return rows, {"steps": steps, "used": None, "widened": True,
+                  "variant_exact": False, "tier_only": True}
 
 
 def _excluded_breakdown(conn: sqlite3.Connection, subject: dict,
@@ -252,13 +283,51 @@ def value_listing(conn: sqlite3.Connection, listing: sqlite3.Row | dict,
         return result
 
     adjusted = [adjust_comp(conn, r, subject, today) for r in rows]
+
+    # --- material-mismatch guard -------------------------------------------
+    # A minimum count is necessary but not sufficient: a comp whose adjusted
+    # value sits more than MATERIAL_MISMATCH_FRACTION from the median of the set
+    # is a different car (wrong options, condition, mis-tagged variant) and is
+    # dropped with a recorded reason rather than dragging the estimate.
+    prelim = statistics.median([a["adjusted_value"] for a in adjusted])
+    rejected = []
+    kept = []
+    for a in adjusted:
+        if prelim and abs(a["adjusted_value"] - prelim) / prelim > MATERIAL_MISMATCH_FRACTION:
+            a = {**a, "rejected_reason": (
+                f"adjusted ${a['adjusted_value']:,.0f} is "
+                f"{abs(a['adjusted_value'] - prelim) / prelim:.0%} from the "
+                f"${prelim:,.0f} median -- treated as materially mismatched")}
+            rejected.append(a)
+        else:
+            kept.append(a)
+
+    if len(kept) < min_low:
+        result = {
+            "status": "insufficient_comps", "confidence": "none",
+            "point_value": None, "low_value": None, "high_value": None,
+            "n_comps": len(kept), "method": "comparable_sales_v1",
+            "detail": {
+                "selection": selection, "rejected_comps": rejected,
+                "explanation": (
+                    f"INSUFFICIENT DATA after rejecting materially mismatched "
+                    f"comps: {len(kept)} usable of {len(adjusted)} matched "
+                    f"({len(rejected)} rejected as too far from the median); "
+                    f"{min_low} are required. No estimate is produced."),
+            },
+        }
+        if store:
+            _store(conn, subject.get("id"), result)
+        return result
+
+    adjusted = kept
     values = [a["adjusted_value"] for a in adjusted]
     core = _trimmed(values)
     point = statistics.median(core)
     low, high = min(core), max(core)
     spread_pct = (high - low) / point if point else 0.0
 
-    n = len(rows)
+    n = len(adjusted)
     if n >= min_high and not selection.get("widened"):
         confidence = "high"
     elif n >= min_med:
@@ -267,6 +336,10 @@ def value_listing(conn: sqlite3.Connection, listing: sqlite3.Row | dict,
         confidence = "low"
     if spread_pct > 0.45 and confidence == "high":
         confidence = "medium"
+    # A comp set that had to drop to same-tier (variant not matched exactly) is
+    # never more than "low" confidence, and a mixed-variant set is flagged.
+    if selection.get("tier_only") or not selection.get("variant_exact", True):
+        confidence = "low"
 
     result = {
         "status": "ok",
@@ -280,6 +353,10 @@ def value_listing(conn: sqlite3.Connection, listing: sqlite3.Row | dict,
             "selection": selection,
             "spread_pct": round(spread_pct, 4),
             "comps": adjusted,
+            "rejected_comps": rejected,
+            "variant_match": ("exact" if selection.get("variant_exact")
+                              else ("same-tier only" if selection.get("tier_only")
+                                    else "mixed")),
             "assumptions_used": [
                 "mileage_adjust_per_mile", "mileage_adjust_cap",
                 "market_trend_pct_per_year", "buyer_premium_pct",
@@ -288,13 +365,18 @@ def value_listing(conn: sqlite3.Connection, listing: sqlite3.Row | dict,
             "explanation": (
                 f"Trimmed median of {len(core)} mileage-adjusted comps drawn from "
                 f"{n} documented completed sales ({selection.get('used')}). "
-                f"Adjusted range ${low:,.0f}-${high:,.0f}."
+                + (f"{len(rejected)} comp(s) rejected as materially mismatched. "
+                   if rejected else "")
+                + f"Adjusted range ${low:,.0f}-${high:,.0f}."
             ),
             "caveats": [
                 "No adjustment for options, service history, accident history, "
                 "paint or colour. Those routinely move a 911 by more than the "
                 "mileage adjustment applied here.",
-            ],
+            ] + ([
+                "Comps are same performance tier but NOT the exact variant, so "
+                "confidence is capped at low. Record exact-variant sales to lift it."
+            ] if (selection.get("tier_only") or not selection.get("variant_exact", True)) else []),
         },
     }
     if store:

@@ -304,6 +304,36 @@ class TestValuation(unittest.TestCase):
                                       store=False, include_synthetic=True)
         self.assertEqual(res["status"], "insufficient_comps")
 
+    def test_material_mismatch_comp_is_rejected(self):
+        # Seven honest comps plus one wildly-priced same-variant outlier.
+        for i in range(7):
+            add_synthetic_comp(self.conn, i, 60000, 50000)
+        add_synthetic_comp(self.conn, 99, 200000, 50000)  # a different car, mis-tagged
+        res = valuation.value_listing(self.conn, self.subject, today=TODAY,
+                                      store=False, include_synthetic=True)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["point_value"], 60000.0)
+        self.assertEqual(len(res["detail"]["rejected_comps"]), 1)
+
+    def test_will_not_cross_performance_tier(self):
+        # Subject is a Carrera S; only Turbo comps exist -> no valuation.
+        for i in range(8):
+            add_synthetic_comp(self.conn, i, 120000, 50000, variant="Turbo")
+        res = valuation.value_listing(self.conn, self.subject, today=TODAY,
+                                      store=False, include_synthetic=True)
+        self.assertEqual(res["status"], "insufficient_comps")
+
+    def test_same_tier_fallback_caps_confidence(self):
+        # Subject Carrera 4S; comps are Carrera S -- same 's' tier, other variant.
+        subject = {**self.subject, "variant": "Carrera 4S"}
+        for i in range(8):
+            add_synthetic_comp(self.conn, i, 60000, 50000, variant="Carrera S")
+        res = valuation.value_listing(self.conn, subject, today=TODAY,
+                                      store=False, include_synthetic=True)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["confidence"], "low")
+        self.assertEqual(res["detail"]["variant_match"], "same-tier only")
+
     def test_every_comp_is_traceable(self):
         for i in range(8):
             add_synthetic_comp(self.conn, i, 60000, 50000)

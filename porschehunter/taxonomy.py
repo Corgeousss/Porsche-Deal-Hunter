@@ -130,6 +130,30 @@ DEAL_STAGES = [
 ]
 
 
+# Performance tiers. Comps must not cross a tier: a base Carrera is never valued
+# off Turbo or GT sales, however close the year and mileage. Used by the
+# valuation engine's fallback step and its material-mismatch guard.
+VARIANT_TIERS = {
+    "base": ["Carrera", "Carrera T", "Carrera 4", "Targa", "Targa 4"],
+    "s": ["Carrera S", "Carrera 4S", "Targa 4S"],
+    "gts": ["Carrera GTS", "Carrera 4 GTS"],
+    "turbo": ["Turbo", "Turbo S"],
+    "gt": ["GT3", "GT3 Touring", "GT3 RS", "GT2", "GT2 RS"],
+    "special": ["Speedster"],
+}
+_VARIANT_TO_TIER = {v: t for t, vs in VARIANT_TIERS.items() for v in vs}
+
+
+def variant_tier(variant: str | None) -> str | None:
+    return _VARIANT_TO_TIER.get(variant) if variant else None
+
+
+def tier_variants(variant: str | None) -> list[str]:
+    """All variants in the same performance tier as ``variant`` (incl. itself)."""
+    t = variant_tier(variant)
+    return list(VARIANT_TIERS.get(t, [])) if t else ([variant] if variant else [])
+
+
 def normalize_generation(gen: str | None) -> list[str]:
     """Expand a family ('997') to its members; pass a specific gen through."""
     return _gens.expand(gen)

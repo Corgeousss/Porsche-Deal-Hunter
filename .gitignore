@@ -2,4 +2,9 @@ __pycache__/
 *.py[cod]
 data/*.db
 data/*.db-journal
+# Operator-specific provider config (may hold licensed endpoint maps / keys).
+data/classic_com_api.json
+data/marketcheck_fields.json
+data/cost_sheet.*
+data/cost_input_sheet.*
 .venv/
