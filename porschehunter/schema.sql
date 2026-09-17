@@ -336,6 +336,37 @@ CREATE TABLE IF NOT EXISTS notifications (
 CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at DESC);
 
 -- ---------------------------------------------------------------------------
+-- Automatic-refresh bookkeeping. One row per dealer domain, so we always know
+-- when each source last refreshed SUCCESSFULLY and can resume oldest-first
+-- after an interruption. The scheduler itself lives in Windows Task Scheduler;
+-- this table only records what actually ran.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS refresh_state (
+    domain        TEXT PRIMARY KEY,
+    last_attempt  TEXT,
+    last_success  TEXT,
+    last_status   TEXT,            -- ok | error | skipped
+    last_error    TEXT,
+    new_count     INTEGER NOT NULL DEFAULT 0,
+    updated_count INTEGER NOT NULL DEFAULT 0,
+    rejected_count INTEGER NOT NULL DEFAULT 0,
+    quarantined_count INTEGER NOT NULL DEFAULT 0,
+    active_count  INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS refresh_runs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at   TEXT NOT NULL,
+    finished_at  TEXT,
+    trigger      TEXT,             -- manual | scheduled
+    domains_done INTEGER NOT NULL DEFAULT 0,
+    new_total    INTEGER NOT NULL DEFAULT 0,
+    alerts_created INTEGER NOT NULL DEFAULT 0,
+    status       TEXT NOT NULL DEFAULT 'running',
+    message      TEXT
+);
+
+-- ---------------------------------------------------------------------------
 -- Reconditioning cost workflow (Task 6). One row per (listing, category).
 -- Every number carries whether it is an estimate, a written quote, or a paid
 -- invoice, so the underwriting can tell a guess from a committed cost.

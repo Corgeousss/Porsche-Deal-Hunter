@@ -621,6 +621,43 @@ def cmd_recon(args):
     return 0
 
 
+def cmd_refresh(args):
+    from . import refresh as _refresh
+    conn = _conn(args)
+    if args.refresh_cmd == "status":
+        st = _refresh.status(conn)
+        lr = st["last_run"]
+        if lr:
+            print(f"Last refresh run #{lr['id']} ({lr['trigger']}): {lr['status']} "
+                  f"started {lr['started_at']} finished {lr['finished_at'] or '-'} "
+                  f"({lr['new_total']} new, {lr['alerts_created']} alerts)")
+        else:
+            print("No refresh has run yet.")
+        print("\nPer-dealer last refresh:")
+        for r in st["per_domain"]:
+            print(f"  {r['domain']:26} last success: {r['last_success'] or 'never':26} "
+                  f"status={r['last_status'] or '-'} active={r['active_count']}")
+        print("\nReminder: automatic refresh runs ONLY when the scheduled task "
+              "fires and this computer is on. Check the task in Windows Task "
+              "Scheduler (\\PorscheDealHunter\\Refresh).")
+        return 0
+    # run
+    print("Refreshing all approved dealers (robots-enforced, 5s/host -- slow on "
+          "purpose). Please wait...")
+    res = _refresh.refresh_all(conn, destination_state=args.destination,
+                               max_pages=args.max_pages, trigger=args.trigger)
+    print(f"\nRefresh #{res['run_id']} done: {res['domains_done']} dealers, "
+          f"{res['new_total']} new listings, {res['alerts_created']} new alerts.")
+    for d in res["domains"]:
+        if d["status"] == "error":
+            print(f"  {d['domain']:26} ERROR: {d.get('error')}")
+        else:
+            print(f"  {d['domain']:26} {d['status']}: +{d['new']} new, "
+                  f"{d['updated']} updated, {d['rejected']} non-911 rejected, "
+                  f"{d['quarantined']} quarantined")
+    return 0
+
+
 def cmd_audit_models(args):
     from . import model_guard as _guard
     conn = _conn(args)
@@ -815,6 +852,17 @@ def build_parser():
                         help="re-verify every active listing is a 911; quarantine non-911s")
     am.add_argument("--dry-run", action="store_true", help="report only, change nothing")
     am.set_defaults(func=cmd_audit_models)
+
+    rf = sub.add_parser("refresh",
+                        help="re-read all approved dealers, update prices, recompute alerts")
+    rfsub = rf.add_subparsers(dest="refresh_cmd", required=True)
+    rfr = rfsub.add_parser("run", help="run one refresh cycle now")
+    rfr.add_argument("--destination", default="OH", help=DEST_STATE_HELP)
+    rfr.add_argument("--max-pages", type=int, default=60)
+    rfr.add_argument("--trigger", default="manual", choices=["manual", "scheduled"])
+    rfr.set_defaults(func=cmd_refresh)
+    rfs = rfsub.add_parser("status", help="show when each dealer last refreshed")
+    rfs.set_defaults(func=cmd_refresh)
 
     rc = sub.add_parser("recon", help="record/show reconditioning cost estimates for a car")
     rc.add_argument("listing_id", type=int)
