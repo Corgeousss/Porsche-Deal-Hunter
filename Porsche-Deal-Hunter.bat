@@ -38,30 +38,36 @@ echo    PORSCHE 911 DEAL HUNTER
 echo    Database: %PORSCHE_DB%   Destination state: %DEST%
 echo ============================================================
 echo.
-echo   1.  Open the dashboard in my web browser
+echo   1.  Open the deal-hunter dashboard  (filters, saved searches,
+echo         alerts, reconditioning form -- all in your web browser)
 echo   2.  List every car currently in the database
-echo   3.  Refresh inventory from Champion Porsche  (takes ~5 min)
+echo   3.  Refresh inventory from all approved dealers  (slow: ~5 min each)
 echo   4.  Scan for opportunities that clear the $8,000 target
 echo   5.  Show which data sources are working / blocked
-echo   6.  Check my internet + re-verify the connectors
-echo   7.  Quit
+echo   6.  Recompute saved-search alerts now
+echo   7.  Check my internet + re-verify the connectors
+echo   8.  Quit
 echo.
 set "choice="
-set /p choice="Type a number (1-7) and press Enter: "
+set /p choice="Type a number (1-8) and press Enter: "
 
 if "%choice%"=="1" goto dashboard
 if "%choice%"=="2" goto listings
 if "%choice%"=="3" goto refresh
 if "%choice%"=="4" goto scan
 if "%choice%"=="5" goto sources
-if "%choice%"=="6" goto validate
-if "%choice%"=="7" exit /b 0
+if "%choice%"=="6" goto alerts
+if "%choice%"=="7" goto validate
+if "%choice%"=="8" exit /b 0
 goto menu
 
 :dashboard
 echo.
 echo Opening http://127.0.0.1:8000 in your browser...
-echo When you are finished looking, click back in THIS window and press Ctrl+C.
+echo The dashboard defaults to 911s under $100,000. Use the left-hand filters
+echo to change price, generation, variant, mileage and more; Save search to
+echo store a search and turn on alerts; the bell shows notifications.
+echo When you are finished, click back in THIS window and press Ctrl+C.
 start "" "http://127.0.0.1:8000"
 python -m porschehunter serve --destination %DEST%
 goto menu
@@ -75,10 +81,26 @@ goto menu
 
 :refresh
 echo.
-echo Reading Champion Porsche's published inventory. This is slow on purpose
-echo (one page every 5 seconds, so we stay a polite visitor). Please wait...
+echo Reading published inventory from every approved dealer in
+echo data\allowed_domains.txt. This is slow on purpose (one page every 5
+echo seconds, so we stay a polite visitor). Please wait...
 echo.
-python -m porschehunter fetch dealer_jsonld --domain champion-porsche.com --max-pages 60
+for /f "usebackq eol=# tokens=* delims= " %%D in ("data\allowed_domains.txt") do (
+  echo   --- %%D ---
+  python -m porschehunter fetch dealer_jsonld --domain %%D --max-pages 60
+)
+echo.
+echo Recomputing saved-search alerts...
+python -m porschehunter alerts run --destination %DEST%
+echo.
+pause
+goto menu
+
+:alerts
+echo.
+python -m porschehunter alerts run --destination %DEST%
+echo.
+python -m porschehunter alerts list --limit 20
 echo.
 pause
 goto menu
