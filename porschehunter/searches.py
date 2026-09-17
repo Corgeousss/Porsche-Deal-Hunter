@@ -23,6 +23,40 @@ from . import filters as _filters
 # ---------------------------------------------------------------------------
 # Saved-search CRUD
 # ---------------------------------------------------------------------------
+# The operator's requested starter searches. Thresholds are ordinary editable
+# saved searches -- change them in the dashboard (Save search over the same name)
+# or with `searches set`. Profit alerts are intentionally NOT enabled on any of
+# these: they stay off until verified comps + costs exist.
+EXAMPLE_SEARCHES = [
+    ("New 997 manual under $60k",
+     {"generations": ["997"], "transmissions": ["manual"], "price_max": 60000},
+     "newest", {"new_match": True, "below_threshold": True}),
+    ("Any Carrera S under $75k",
+     {"variants": ["Carrera S"], "price_max": 75000},
+     "price_asc", {"new_match": True, "below_threshold": True}),
+    ("Any 991 under $100k",
+     {"generations": ["991"], "price_max": 100000},
+     "price_asc", {"new_match": True, "below_threshold": True}),
+    ("Any 911 under $50k",
+     {"price_max": 50000},
+     "price_asc", {"new_match": True, "below_threshold": True}),
+    ("Price reductions of $5,000+",
+     {}, "largest_reduction", {"price_drop": True, "drop_min": 5000}),
+]
+
+
+def seed_examples(conn) -> int:
+    """Create the starter searches if they are not already present. Returns how
+    many were newly created (existing ones are left untouched so edits stick)."""
+    existing = {s["name"] for s in list_searches(conn)}
+    created = 0
+    for name, filters, sort, notify in EXAMPLE_SEARCHES:
+        if name not in existing:
+            save_search(conn, name, filters, sort, notify)
+            created += 1
+    return created
+
+
 def save_search(conn, name: str, filters: dict, sort: str | None = None,
                 notify: dict | None = None) -> int:
     now = _db.utcnow()

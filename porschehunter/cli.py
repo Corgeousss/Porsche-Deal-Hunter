@@ -584,12 +584,42 @@ def cmd_alerts(args):
 
 def cmd_searches(args):
     conn = _conn(args)
+    sub = getattr(args, "searches_cmd", None) or "list"
+    if sub == "seed":
+        n = _searches.seed_examples(conn)
+        print(f"Seeded {n} example search(es). "
+              f"{len(_searches.EXAMPLE_SEARCHES) - n} already existed and were kept.")
+        return 0
+    if sub == "delete":
+        rows = [s for s in _searches.list_searches(conn) if s["name"] == args.name]
+        if not rows:
+            print(f"No saved search named {args.name!r}.", file=sys.stderr)
+            return 1
+        _searches.delete_search(conn, rows[0]["id"])
+        print(f"Deleted saved search {args.name!r}.")
+        return 0
+    if sub == "set":
+        try:
+            filters = json.loads(args.filters) if args.filters else {}
+        except json.JSONDecodeError as exc:
+            print(f"--filters must be valid JSON: {exc}", file=sys.stderr)
+            return 1
+        notify = {a: True for a in (args.alert or [])}
+        if args.drop_min is not None:
+            notify["price_drop"] = True
+            notify["drop_min"] = args.drop_min
+        sid = _searches.save_search(conn, args.name, filters, args.sort, notify)
+        print(f"Saved search #{sid} {args.name!r} (alerts: "
+              f"{', '.join(k for k,v in notify.items() if v is True) or 'none'}).")
+        return 0
+    # list
     rows = _searches.list_searches(conn)
     if not rows:
-        print("No saved searches. Create them in the dashboard (Save search).")
+        print("No saved searches. Create them in the dashboard (Save search), "
+              "or run `searches seed` for the starter set.")
         return 0
     for s in rows:
-        alerts = ", ".join(k for k, v in (s["notify"] or {}).items() if v) or "none"
+        alerts = ", ".join(k for k, v in (s["notify"] or {}).items() if v is True) or "none"
         print(f"#{s['id']}  {s['name']}")
         print(f"      filters: {json.dumps(s['filters'])}")
         print(f"      sort: {s['sort'] or 'newest'}   alerts: {alerts}   "
@@ -845,7 +875,24 @@ def build_parser():
     all_.add_argument("--limit", type=int, default=50)
     all_.set_defaults(func=cmd_alerts)
 
-    ss = sub.add_parser("searches", help="list saved searches")
+    ss = sub.add_parser("searches", help="manage saved searches")
+    sssub = ss.add_subparsers(dest="searches_cmd")
+    sssub.add_parser("list", help="list saved searches").set_defaults(func=cmd_searches)
+    sssub.add_parser("seed", help="create the starter set of saved searches").set_defaults(func=cmd_searches)
+    ssset = sssub.add_parser("set", help="create or edit a saved search")
+    ssset.add_argument("name")
+    ssset.add_argument("--filters", help="filter object as JSON, e.g. '{\"price_max\":60000}'")
+    ssset.add_argument("--sort")
+    ssset.add_argument("--alert", action="append",
+                       choices=["new_match", "below_threshold", "price_drop",
+                                "auction_soon", "meets_profit"],
+                       help="enable an alert type (repeatable)")
+    ssset.add_argument("--drop-min", type=float,
+                       help="minimum price drop in USD for a price_drop alert (e.g. 5000)")
+    ssset.set_defaults(func=cmd_searches)
+    ssdel = sssub.add_parser("delete", help="delete a saved search by name")
+    ssdel.add_argument("name")
+    ssdel.set_defaults(func=cmd_searches)
     ss.set_defaults(func=cmd_searches)
 
     am = sub.add_parser("audit-models",
