@@ -169,6 +169,31 @@ Porsche trim resolution.
 fallback that runs structural checks only. **It has never been called live from
 this environment** — see AUDIT.md.
 
+## 3a. Working dealer JSON-LD sources (validated live, 2026-09-17)
+
+These dealer domains have been validated end-to-end: robots.txt permits our
+User-Agent on the inventory pages (checked by fetching robots.txt **with our own
+UA**, since some CDNs vary their answer for `Python-urllib`), the sitemap exposes
+real 911 detail pages, and those pages carry `schema.org` JSON-LD with a numeric
+price, a VIN and mileage. All are opted into `data/allowed_domains.txt` and read
+through the one `dealer_jsonld` connector (robots enforced, 5s/host).
+
+| Domain | Region | How it is read | Notes |
+|---|---|---|---|
+| champion-porsche.com | Pompano Beach, FL | sitemap discovery | Franchised Porsche dealer; mostly newer 992s. |
+| marshallgoldman.com | Warrensville Heights OH + Beverly Hills CA | sitemap discovery | Deepest used 997/991 pool; some cars under $100k. |
+| 1of1motorsports.com | Norwalk, CT | sitemap discovery | Full JSON-LD incl. VIN; skews high-end. |
+| gatewayclassiccars.com | Nationwide (IL HQ) | **per-URL only** | Regularly lists sub-$100k 996/997. Its per-vehicle sitemaps live on an S3 bucket whose robots.txt disallows crawling, so bulk discovery is blocked; add individual cars with `fetch dealer_jsonld --url <car>`. |
+| autosofdallas.com | Plano/Irving, TX | sitemap discovery | Platform validated (rich JSON-LD w/ VIN); allowlisted for when 911 stock appears — none at integration time. |
+
+**Franchised `*.porsche.com` dealers are mostly unusable** for a polite
+stdlib client: their CDN returns 403/429 to our User-Agent on robots.txt.
+Champion is a rare open deployment. **Most independent/collector dealers
+JS-render their vehicle JSON-LD**, so a non-JS fetch sees only `AutoDealer`
+org markup and no vehicle data — sitemap size is not a proxy for usability.
+Marketplaces/aggregators (Cars.com, Autotrader, Carvana, CarGurus, CarMax,
+Bring a Trailer, Cars & Bids) are excluded by policy regardless of robots.
+
 ## 4. Dealer websites publishing schema.org Vehicle data
 
 Dealer platforms commonly embed a `schema.org/Vehicle` JSON-LD block for search
