@@ -33,17 +33,36 @@ def _host(url: str) -> str:
 
 
 def robots_allows(url: str, timeout: int = 15) -> bool:
+    """Fetch robots.txt WITH OUR REAL User-Agent, then check it.
+
+    ``RobotFileParser.read()`` fetches robots.txt as ``Python-urllib``, and a
+    number of dealer CDNs block or vary their response for that agent -- which
+    produced false "disallowed" results and hid sites we are in fact permitted
+    to read. We fetch robots.txt as the same UA we crawl with and parse that.
+
+    Fail-closed on anything that signals "not welcome": a 401/403/429 or a 5xx
+    on robots.txt, a timeout, or a refused connection all mean off-limits. A 404
+    (no robots.txt) means the site published no rules -> allowed.
+    """
     base = _host(url)
     if base not in _robots_cache:
         rp = urllib.robotparser.RobotFileParser()
-        rp.set_url(base + "/robots.txt")
+        robots_url = base + "/robots.txt"
         try:
-            rp.read()
+            req = urllib.request.Request(robots_url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read(1_000_000)
+                charset = resp.headers.get_content_charset() or "utf-8"
+            rp.parse(raw.decode(charset, errors="replace").splitlines())
+            _robots_cache[base] = rp
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                rp.parse([])           # no robots.txt -> nothing disallowed
+                _robots_cache[base] = rp
+            else:
+                _robots_cache[base] = None   # 401/403/429/5xx -> off limits
         except Exception:
-            # Could not read robots.txt -> treat the site as off limits.
-            _robots_cache[base] = None
-            return False
-        _robots_cache[base] = rp
+            _robots_cache[base] = None       # timeout, refused, TLS error -> off limits
     rp = _robots_cache[base]
     if rp is None:
         return False
