@@ -251,5 +251,34 @@ class TestDashboardPayloads(unittest.TestCase):
         self.assertIn("911 Deal Hunter", html)
 
 
+class TestAssistedImport(unittest.TestCase):
+    def setUp(self):
+        self.conn = fresh_db()
+
+    def test_facebook_911_imports_and_is_searchable(self):
+        r = dashboard._assisted_import(self.conn, {
+            "url": "https://www.facebook.com/marketplace/item/123",
+            "title": "2001 Porsche 911 Carrera", "price": "$28,500",
+            "mileage": "78,000", "state": "CA"})
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["source"], "facebook_marketplace")
+        rows = filters.enrich(self.conn, "OH")
+        car = next(v for v in rows if v["id"] == r["id"])
+        self.assertEqual(car["price"], 28500.0)
+        # searchable alongside dealer inventory
+        hit = filters.apply_filters(rows, {"price_max": 50000, "generations": ["996"]})
+        self.assertIn(r["id"], [v["id"] for v in hit])
+
+    def test_facebook_cayman_is_rejected(self):
+        r = dashboard._assisted_import(self.conn, {
+            "url": "https://www.facebook.com/marketplace/item/999",
+            "title": "2014 Porsche Cayman S"})
+        self.assertTrue(r.get("rejected"))
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0], 0)
+
+    def test_import_requires_url(self):
+        self.assertIn("error", dashboard._assisted_import(self.conn, {"title": "x"}))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -34,6 +34,7 @@ from . import filters as _filters
 from . import recon as _recon
 from . import searches as _searches
 from . import taxonomy as _tax
+from .sources import manual as _manual
 
 PRICE_PRESETS = [30000, 50000, 75000, 100000, 150000, 200000]
 
@@ -230,6 +231,7 @@ _PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
   <span class=spacer></span>
   <select id=sort style="width:auto"></select>
   <select id=savedSel style="width:auto"><option value="">Saved searches…</option></select>
+  <button id=btnImport title="Import a Facebook/private listing you are viewing">Import listing</button>
   <button id=btnSave>Save search</button>
   <button id=btnRefresh title="Recompute matches and alerts">Refresh</button>
   <button class="bell" id=btnBell>🔔<span class=badge id=badge style="display:none">0</span></button>
@@ -415,9 +417,11 @@ function card(v){
     ? '<span class="pill go">net '+money(v.net_profit)+(v.roi!=null?' · ROI '+(v.roi*100).toFixed(0)+'%':'')+'</span>'
     : '<span class="pill no">UNVALUED — no verified comps</span>';
   const dup=v.is_duplicate_vin?' <span class="pill dup">dup VIN</span>':'';
+  const AUTO=['dealer_jsonld','marketcheck'];
+  const assisted=!AUTO.includes(v.source_key)?' <span class="pill warn">assisted import</span>':'';
   const img=v.photo_url?'<img loading=lazy src="'+esc(v.photo_url)+'">':'<img alt="">';
   return '<div class="card'+(hit?' hit':'')+'">'+img+'<div class=info>'+
-    '<h3>'+title+' '+val+dup+'</h3>'+
+    '<h3>'+title+' '+val+dup+assisted+'</h3>'+
     '<div class=meta><span class=price>'+money(v.price)+'</span> · '+esc(v.generation||'gen?')+' · '+
       (v.mileage?v.mileage.toLocaleString()+' mi':'mileage?')+' · '+esc(v.transmission||'trans?')+' · '+
       esc(v.body_style||'body?')+'</div>'+
@@ -471,6 +475,34 @@ async function saveRecon(id){
       {listing_id:id,category:c.key,amount:+amt,basis:$('#rb_'+c.key).value})});}}
   closeModal();apply();
 }
+const IMPORT_FIELDS=[['url','Listing URL (required)'],['title','Title (e.g. 2008 Porsche 911 Carrera S)'],
+ ['price','Asking price'],['year','Year'],['variant','Variant'],['mileage','Mileage'],
+ ['vin','VIN (optional)'],['state','State (2-letter)'],['city','City'],
+ ['exterior_color','Exterior colour'],['image','Photo URL'],['notes','Notes']];
+function openImport(pre){
+  pre=pre||{};
+  const rows=IMPORT_FIELDS.map(([k,lab])=>
+    '<div style="margin:5px 0"><div class=grp-label>'+lab+'</div>'+
+    '<input id="im_'+k+'" type="text" value="'+esc(pre[k]||'')+'"></div>').join('');
+  $('#modal').innerHTML='<h3>Import a listing (assisted)</h3>'+
+    '<div class=meta>For Facebook Marketplace and other private listings with no '+
+    'authorized feed. Enter what you can see (or use the one-click bookmarklet — '+
+    'see FACEBOOK_IMPORT.md). The original URL is preserved; missing fields stay '+
+    'unknown. Non-911s are rejected. This is an ASSISTED import, kept distinct '+
+    'from automatic dealer discovery.</div>'+rows+
+    '<div style="margin-top:10px"><button class=primary onclick="doImport()">Import</button> '+
+    '<button onclick="closeModal()">Cancel</button></div><div id=imMsg class=meta></div>';
+  $('#modalBg').classList.add('open');
+}
+async function doImport(){
+  const b={}; IMPORT_FIELDS.forEach(([k])=>{const v=$('#im_'+k).value.trim(); if(v)b[k]=v;});
+  if(!b.url){$('#imMsg').textContent='A listing URL is required.';return;}
+  const r=await api('/api/import',{method:'POST',body:JSON.stringify(b)});
+  if(r.error){$('#imMsg').textContent='Rejected: '+r.error;return;}
+  $('#imMsg').textContent=(r.created?'Imported':'Updated')+' listing #'+r.id+' (source: '+r.source+'). '+
+    (r.missing&&r.missing.length?'Missing: '+r.missing.join(', '):'');
+  await apply();
+}
 function openStage(id){
   const opts=['','needs_inspection','contacted_seller','offer_submitted','acquired','reconditioning','listed_for_resale','sold']
     .map(s=>'<option value="'+s+'">'+(s||'(none)')+'</option>').join('');
@@ -501,6 +533,13 @@ async function init(){
   $('#sort').innerHTML=SORTS.map(([v,l])=>'<option value="'+v+'">'+l+'</option>').join('');
   $('#sort').onchange=e=>{STATE.sort=e.target.value;apply();};
   $('#btnReset').onclick=reset;$('#btnSave').onclick=saveSearch;
+  $('#btnImport').onclick=()=>openImport();
+  // One-click bookmarklet hands data via the URL fragment (#import=<json>) so it
+  // works cross-origin from facebook.com without any CORS or automated access.
+  if(location.hash.startsWith('#import=')){
+    try{const data=JSON.parse(decodeURIComponent(location.hash.slice(8)));
+        history.replaceState(null,'',location.pathname); openImport(data);}catch(e){}
+  }
   $('#btnRefresh').onclick=async()=>{const r=await api('/api/alerts/run',{method:'POST'});await loadNotifs();await apply();};
   $('#btnBell').onclick=()=>{$('#notifPanel').classList.toggle('open');loadNotifs();};
   $('#notifPanel').onclick=e=>{if(e.target.id==='notifPanel')e.target.classList.remove('open');};
@@ -599,6 +638,8 @@ def serve(db_path, host="127.0.0.1", port=8000, destination_state="OH",
                                         float(body["amount"]),
                                         body.get("basis", "estimate"), body.get("note"))
                         self._send({"ok": True, "summary": _recon.summary(conn, int(body["listing_id"]))})
+                    elif u.path == "/api/import":
+                        self._send(_assisted_import(conn, body))
                     elif u.path == "/api/stage":
                         _set_stage(conn, int(body["listing_id"]), body.get("deal_stage"))
                         self._send({"ok": True})
@@ -624,6 +665,46 @@ def serve(db_path, host="127.0.0.1", port=8000, destination_state="OH",
             httpd.serve_forever()
         except KeyboardInterrupt:
             print("\nstopped")
+
+
+def _assisted_import(conn, body: dict) -> dict:
+    """Operator-approved import of a single listing the operator is viewing
+    (e.g. a Facebook Marketplace car). Distinguished from automatic discovery by
+    its source (facebook_marketplace / other manual) and data_source_note. Runs
+    through the same 911 guard, so a non-911 is rejected here too.
+    """
+    url = (body.get("url") or "").strip()
+    if not url:
+        return {"error": "A listing URL is required."}
+    def _num(v):
+        try:
+            return float(str(v).replace(",", "").replace("$", "").strip()) if v not in (None, "") else None
+        except ValueError:
+            return None
+    try:
+        lid, created, report = _manual.add_listing(
+            conn, url,
+            title=body.get("title") or None,
+            year=int(body["year"]) if str(body.get("year") or "").isdigit() else None,
+            variant=body.get("variant") or None,
+            body_style=body.get("body_style") or None,
+            transmission=body.get("transmission") or None,
+            mileage=int(_num(body.get("mileage"))) if _num(body.get("mileage")) else None,
+            vin=body.get("vin") or None,
+            price=_num(body.get("price")),
+            seller_type=body.get("seller_type") or "private",
+            seller_city=body.get("city") or None,
+            seller_state=body.get("state") or None,
+            exterior_color=body.get("exterior_color") or None,
+            notes=body.get("notes") or None,
+            photos=[body["image"]] if body.get("image") else None,
+            decode_vin=bool(body.get("vin")))
+    except _manual.NotA911 as exc:
+        return {"error": str(exc), "rejected": True}
+    return {"ok": True, "id": lid, "created": created,
+            "source": report.get("source_key"),
+            "notices": report.get("notices", []),
+            "missing": report.get("missing_fields", [])}
 
 
 def _set_stage(conn, listing_id: int, stage: str | None) -> None:
