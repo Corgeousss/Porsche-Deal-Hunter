@@ -741,6 +741,15 @@ class TestJsonLd(unittest.TestCase):
         rec = jsonld.parse_vehicle(jsonld.extract_jsonld(page), detail)["record"]
         self.assertEqual(rec["url"], detail)
 
+    def test_call_for_price_is_unknown_not_zero(self):
+        page = """<html><head><script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"Vehicle","name":"2021 Porsche 911 Carrera",
+         "brand":{"name":"Porsche"},"modelDate":"2021","vehicleIdentificationNumber":"WP0AA2A99MS700010",
+         "offers":{"@type":"Offer","price":0,"priceCurrency":"USD"}}
+        </script></head></html>"""
+        rec = jsonld.parse_vehicle(jsonld.extract_jsonld(page), "https://d.invalid/x")["record"]
+        self.assertIsNone(rec["price"])   # $0 = "call for price", not a real ask
+
     def test_only_911_filter_recognises_the_line(self):
         self.assertTrue(jsonld.is_911("2015 Porsche 911 Carrera S"))
         self.assertTrue(jsonld.is_911("Porsche 993 Targa"))

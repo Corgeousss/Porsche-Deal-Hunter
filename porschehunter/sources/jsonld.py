@@ -94,6 +94,16 @@ def _type_of(obj: dict) -> list[str]:
     return [t] if isinstance(t, str) else list(t)
 
 
+MIN_PLAUSIBLE_PRICE = 1000.0
+
+
+def _plausible_price(price: float | None) -> float | None:
+    """Reject placeholder prices ($0, $1, "call for price" encoded as 0)."""
+    if price is None or price < MIN_PLAUSIBLE_PRICE:
+        return None
+    return price
+
+
 def _num(value) -> float | None:
     if value is None:
         return None
@@ -127,8 +137,10 @@ def parse_vehicle(objects: list[dict], url: str) -> dict | None:
         (_TYPE_RANK.get(t, 3) for t in _type_of(o)), default=3))
 
     parts = [_extract_one(o, url) for o in candidates]
-    record: dict = {}
-    for p in parts:
+    # Seed from the top-ranked candidate so every field key is present (some may
+    # be None), then fill gaps from lower-ranked candidates.
+    record: dict = dict(parts[0]["record"])
+    for p in parts[1:]:
         for k, v in p["record"].items():
             if record.get(k) in (None, "", []) and v not in (None, "", []):
                 record[k] = v
@@ -215,7 +227,9 @@ def _extract_one(vehicle: dict, url: str) -> dict:
             "vin": _vin.normalize(vehicle.get("vehicleIdentificationNumber")
                                   or vehicle.get("serialNumber")
                                   or vehicle.get("mpn")),
-            "price": _num(offer.get("price")),
+            # A 911 is never listed at $0/$1 -- dealers encode "call for price"
+            # that way. Store it as unknown rather than a misleading $0.
+            "price": _plausible_price(_num(offer.get("price"))),
             "currency": offer.get("priceCurrency") or "USD",
             "listing_type": "fixed",
             "seller_type": "dealer",
