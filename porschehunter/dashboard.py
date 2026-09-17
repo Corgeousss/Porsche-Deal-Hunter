@@ -78,8 +78,24 @@ def options_payload(conn, destination_state: str) -> dict:
             "active_listings": rows["c"], "unique_vins": rows["v"],
         })
 
+    # Per-dealer-domain contribution (all dealer sites share source_key
+    # 'dealer_jsonld', so unique active vehicles are counted by listing host).
+    dealer_coverage: dict[str, dict] = {}
+    for r in active:
+        host = urllib.parse.urlparse(r["url"]).netloc.replace("www.", "")
+        d = dealer_coverage.setdefault(host, {"host": host, "active_listings": 0,
+                                              "vins": set()})
+        d["active_listings"] += 1
+        if r["vin"]:
+            d["vins"].add(r["vin"].upper())
+    dealer_coverage = sorted(
+        ({"host": d["host"], "active_listings": d["active_listings"],
+          "unique_vins": len(d["vins"])} for d in dealer_coverage.values()),
+        key=lambda x: -x["active_listings"])
+
     return {
         "generation_groups": _tax.generation_options(),
+        "dealer_coverage": dealer_coverage,
         "available_variants": _tax.AVAILABLE_VARIANTS,
         "all_variants": _tax.ALL_VARIANTS,
         "body_styles": _tax.BODY_STYLES,
@@ -481,7 +497,7 @@ async function loadSearches(){const d=await api('/api/searches');
 async function init(){
   OPT=await api('/api/options');
   $('#hsub').textContent=OPT.counts.total_active+' active · '+OPT.counts.unique_vins+' unique VINs · dest '+OPT.destination_state;
-  $('#coverage').textContent=' · sources: '+OPT.source_coverage.filter(c=>c.active_listings).map(c=>c.key+'('+c.active_listings+')').join(', ');
+  $('#coverage').textContent=' · dealers: '+(OPT.dealer_coverage||[]).map(c=>c.host+'('+c.active_listings+')').join(', ');
   $('#sort').innerHTML=SORTS.map(([v,l])=>'<option value="'+v+'">'+l+'</option>').join('');
   $('#sort').onchange=e=>{STATE.sort=e.target.value;apply();};
   $('#btnReset').onclick=reset;$('#btnSave').onclick=saveSearch;
