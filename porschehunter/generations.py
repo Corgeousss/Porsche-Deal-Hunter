@@ -121,8 +121,28 @@ def _match(text: str, patterns) -> str | None:
     return None
 
 
+import re as _re
+
+_WORD_CACHE: dict[str, "_re.Pattern"] = {}
+
+
+def _match_word(text: str, patterns) -> str | None:
+    """Like _match but matches each needle on word boundaries, so 'Turbo' does
+    NOT match 'twin-turbocharged' (a 991.2/992 Carrera is turbocharged but is a
+    Carrera, not a Turbo). Multi-word needles keep working."""
+    low = text.lower()
+    for label, needles in patterns:
+        for n in needles:
+            rx = _WORD_CACHE.get(n)
+            if rx is None:
+                rx = _WORD_CACHE[n] = _re.compile(r"(?<!\w)" + _re.escape(n.strip()) + r"(?!\w)")
+            if rx.search(low):
+                return label
+    return None
+
+
 def normalize_variant(text: str | None) -> str | None:
-    return _match(text, _VARIANT_PATTERNS) if text else None
+    return _match_word(text, _VARIANT_PATTERNS) if text else None
 
 
 def normalize_body_style(text: str | None) -> str | None:

@@ -86,6 +86,13 @@ class TestGenerations(unittest.TestCase):
         self.assertEqual(generations.normalize_variant("2011 911 Turbo S"), "Turbo S")
         self.assertEqual(generations.normalize_variant("Carrera 4S Cabriolet"), "Carrera 4S")
 
+    def test_turbocharged_carrera_is_not_a_turbo(self):
+        # 991.2/992 Carreras are twin-turbocharged but are Carreras, not Turbos.
+        self.assertEqual(generations.normalize_variant(
+            "2019 Porsche 911 Carrera, twin-turbocharged 3.0L flat-six"), "Carrera")
+        self.assertEqual(generations.normalize_variant(
+            "2021 911 Carrera S with turbocharged engine"), "Carrera S")
+
     def test_transmission(self):
         self.assertEqual(generations.normalize_transmission("7-Speed PDK"), "pdk")
         self.assertEqual(generations.normalize_transmission("Tiptronic S"), "tiptronic")
