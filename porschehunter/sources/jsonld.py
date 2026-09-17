@@ -189,9 +189,11 @@ def _extract_one(vehicle: dict, url: str) -> dict:
     images = [i.get("url") if isinstance(i, dict) else i for i in images]
     images = [i for i in images if isinstance(i, str)]
 
-    listing_url = offer.get("url") or vehicle.get("url") or url
-    if isinstance(listing_url, str) and not listing_url.lower().startswith("http"):
-        listing_url = urllib.parse.urljoin(url, listing_url)
+    # Key the listing on the detail page we actually fetched, NOT the URL the
+    # JSON-LD declares. Some dealer platforms (e.g. Marshall Goldman) point
+    # offers.url at a generic inventory landing page, which would collapse every
+    # distinct car onto one row. The fetched URL is always the unique VDP.
+    listing_url = url
 
     gen, ambiguous = _gens.from_year(year)
     return {

@@ -727,6 +727,20 @@ class TestJsonLd(unittest.TestCase):
         self.assertEqual(parsed["record"]["price"], 89500.0)
         self.assertEqual(len(parsed["photos"]), 2)
 
+    def test_listing_keyed_on_fetched_url_not_declared_url(self):
+        # Some dealers point offers.url at a generic landing page; the listing
+        # must be keyed on the actual detail page we fetched, or distinct cars
+        # collapse onto one row.
+        page = """<html><head><script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"Vehicle","name":"2008 Porsche 911 Carrera S",
+         "brand":{"name":"Porsche"},"modelDate":"2008","vehicleIdentificationNumber":"WP0AB29958S700009",
+         "offers":{"@type":"Offer","price":48000,"priceCurrency":"USD",
+           "url":"https://d.invalid/inventory/all/"}}
+        </script></head></html>"""
+        detail = "https://d.invalid/detail-2008-porsche-911-carrera-s-vin9"
+        rec = jsonld.parse_vehicle(jsonld.extract_jsonld(page), detail)["record"]
+        self.assertEqual(rec["url"], detail)
+
     def test_only_911_filter_recognises_the_line(self):
         self.assertTrue(jsonld.is_911("2015 Porsche 911 Carrera S"))
         self.assertTrue(jsonld.is_911("Porsche 993 Targa"))
