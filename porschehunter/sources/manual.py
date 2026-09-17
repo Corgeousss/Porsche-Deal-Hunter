@@ -13,8 +13,13 @@ import urllib.parse
 
 from .. import db as _db
 from .. import generations as _gens
+from .. import model_guard as _guard
 from .. import vin as _vin
 from .base import IngestResult
+
+
+class NotA911(ValueError):
+    """Raised when a manually-entered listing is not a Porsche 911."""
 
 # Maps a hostname to the registered source key, so a pasted URL is filed
 # against the marketplace it actually came from.
@@ -76,6 +81,15 @@ def add_listing(conn, url: str, *, title=None, year=None, generation=None,
         if year is None:
             year = off.get("model_year")
 
+    # 911-only rule. The operator asserting a URL is a positive signal, but a
+    # non-911 model named in the title/variant is a hard reject.
+    verdict, reason = _guard.classify_911(
+        title=title, variant=variant, operator_asserted=True)
+    if verdict == _guard.VERDICT_REJECTED:
+        raise NotA911(
+            f"This is not a Porsche 911 ({reason}). This tool is 911-only; "
+            "the listing was not added.")
+
     if generation is None:
         generation, ambiguous = _gens.from_year(year)
         if ambiguous:
@@ -125,6 +139,19 @@ def add_listing(conn, url: str, *, title=None, year=None, generation=None,
                 report["notices"].append(
                     f"vPIC says this VIN is a {row['make']}, not a Porsche. Check the VIN."
                 )
+            # The VIN is authoritative: if it decodes to a non-911 model, the
+            # row is quarantined out of the active 911 inventory (audit trail
+            # kept) even though the operator asserted it was a 911.
+            v2, reason2 = _guard.classify_911(
+                title=title, variant=variant, vin_model=row.get("model"),
+                operator_asserted=True)
+            if v2 == _guard.VERDICT_REJECTED:
+                conn.execute(
+                    "UPDATE listings SET status='quarantined', quarantine_reason=? WHERE id=?",
+                    (reason2, listing_id))
+                conn.commit()
+                report["notices"].append(f"Quarantined (not a 911): {reason2}.")
+                report["verdict"] = "quarantine"
 
     missing = [r["field"] for r in conn.execute(
         "SELECT field FROM missing_fields WHERE listing_id=? ORDER BY field", (listing_id,))]

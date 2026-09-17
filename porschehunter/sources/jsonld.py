@@ -25,8 +25,14 @@ from pathlib import Path
 from .. import db as _db
 from .. import generations as _gens
 from .. import http_util
+from .. import model_guard as _guard
 from .. import vin as _vin
 from .base import IngestResult
+
+# Re-exported so callers (and tests) can reach the shared 911 helpers here too.
+is_911 = _guard.is_911
+is_non_911_model = _guard.is_non_911_model
+looks_like_911_url = _guard.looks_like_911_url
 
 ALLOWLIST_PATH = Path("data/allowed_domains.txt")
 
@@ -246,22 +252,6 @@ def _extract_one(vehicle: dict, url: str) -> dict:
     }
 
 
-# Tokens unique to the 911 line. "Carrera"/"Targa" never appear on a Macan,
-# Cayenne, Panamera, Boxster or Cayman, so they safely identify a 911. "911"
-# must be matched with digit boundaries -- dealer stock numbers embedded in a
-# URL (e.g. ".../id-65391149") contain "911" as a coincidental digit run and
-# must NOT be read as the model.
-_NINE11_RE = re.compile(r"(?<!\d)911(?!\d)|carrera|targa", re.IGNORECASE)
-
-
-def is_911(text: str | None) -> bool:
-    return bool(_NINE11_RE.search(text or ""))
-
-
-def looks_like_911_url(url: str) -> bool:
-    return is_911(url)
-
-
 def ingest_url(conn, url: str, *, require_porsche: bool = True,
                only_911: bool = False) -> tuple[int | None, bool, dict]:
     report: dict = {"notices": []}
@@ -285,11 +275,25 @@ def ingest_url(conn, url: str, *, require_porsche: bool = True,
     rec = parsed["record"]
     brand = (parsed.get("brand") or "") + " " + (rec.get("title") or "")
     if require_porsche and "porsche" not in brand.lower():
-        return None, False, {"notices": [f"Skipped: not a Porsche ({brand.strip() or 'unknown'})."]}
-    if only_911 and not (is_911(rec.get("title")) or is_911(rec.get("variant"))
-                         or is_911(url)):
-        return None, False, {"notices": [
-            f"Skipped: not a 911 ({rec.get('title') or 'unknown model'})."]}
+        return None, False, {"notices": [f"Skipped: not a Porsche ({brand.strip() or 'unknown'})."],
+                             "verdict": "rejected"}
+
+    # Establish the model. Decode the VIN FIRST (authoritative) so a Cayman with
+    # a "Carrera"-flavoured title cannot slip in on text alone.
+    vin_model = None
+    if rec.get("vin"):
+        dec = _vin.decode_and_store(conn, rec["vin"], model_year=rec.get("year"))
+        vin_model = (dec.get("row") or {}).get("model")
+    verdict, reason = _guard.classify_911(
+        title=rec.get("title"), variant=rec.get("variant"), vin_model=vin_model)
+
+    if only_911 and verdict == _guard.VERDICT_REJECTED:
+        return None, False, {"notices": [f"Rejected (not a 911): {reason}."],
+                             "verdict": "rejected"}
+    if only_911 and verdict == _guard.VERDICT_QUARANTINE:
+        rec = {**rec, "status": "quarantined", "quarantine_reason": reason}
+        report["notices"].append(f"Quarantined: {reason}.")
+
     if parsed["ambiguous_generation"]:
         report["notices"].append(
             f"Model year {rec['year']} spans two generations; '{rec['generation']}' assumed."
@@ -298,8 +302,7 @@ def ingest_url(conn, url: str, *, require_porsche: bool = True,
     listing_id, created = _db.upsert_listing(conn, rec, raw=parsed["raw"])
     if parsed["photos"]:
         _db.add_photos(conn, listing_id, parsed["photos"])
-    if rec.get("vin"):
-        _vin.decode_and_store(conn, rec["vin"], model_year=rec.get("year"))
+    report["verdict"] = verdict
     report["missing_fields"] = [r["field"] for r in conn.execute(
         "SELECT field FROM missing_fields WHERE listing_id=?", (listing_id,))]
     return listing_id, created, report
@@ -316,7 +319,10 @@ def ingest(conn, urls: list[str], *, only_911: bool = False) -> IngestResult:
             continue
         res.seen += 1
         if lid is None:
+            res.rejected += int(rep.get("verdict") == "rejected")
             continue
+        if rep.get("verdict") == "quarantine":
+            res.quarantined += 1
         res.new += int(created)
         res.updated += int(not created)
         res.listing_ids.append(lid)
@@ -484,7 +490,7 @@ def ingest_domain(conn, domain: str, max_pages: int = 40,
             break
         fetched += 1
         try:
-            listing_id, created, _rep = ingest_url(conn, url, only_911=only_911)
+            listing_id, created, rep = ingest_url(conn, url, only_911=only_911)
         except http_util.NotAllowed as exc:
             res.message += f"{url}: {exc}\n"
             continue
@@ -493,11 +499,15 @@ def ingest_domain(conn, domain: str, max_pages: int = 40,
             continue
         res.seen += 1
         if listing_id is None:
+            res.rejected += int(rep.get("verdict") == "rejected")
             continue
+        if rep.get("verdict") == "quarantine":
+            res.quarantined += 1
         res.new += int(created)
         res.updated += int(not created)
         res.listing_ids.append(listing_id)
 
     res.message += (f"fetched {fetched} pages, {res.seen} parsed as vehicles, "
-                    f"{res.new} new Porsche 911 listings, {res.updated} updated")
+                    f"{res.new} new Porsche 911 listings, {res.updated} updated, "
+                    f"{res.rejected} rejected as non-911, {res.quarantined} quarantined")
     return res

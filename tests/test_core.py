@@ -761,6 +761,10 @@ class TestJsonLd(unittest.TestCase):
         self.assertFalse(jsonld.looks_like_911_url(
             "https://d.invalid/vehicle-details-new-2026-porsche-macan--id-65391149"))
         self.assertFalse(jsonld.is_911("id-65391149"))
+        # A Cayman advertised with "Carrera S wheels" is NOT a 911.
+        self.assertFalse(jsonld.is_911("2007 Porsche Cayman S - Carrera S Wheels"))
+        self.assertTrue(jsonld.is_non_911_model("2018 Porsche 718 Boxster"))
+        self.assertFalse(jsonld.is_non_911_model("2016 Porsche 911 Carrera S"))
 
     def test_domain_allowlist_blocks_by_default(self):
         self.assertFalse(jsonld.domain_allowed("https://example.invalid/x", allowlist=set()))

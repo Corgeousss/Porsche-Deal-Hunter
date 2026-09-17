@@ -247,6 +247,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
             ("ppi_done", "TEXT"),
             ("seller_docs", "TEXT"),
             ("original_status", "TEXT"),
+            ("quarantine_reason", "TEXT"),
         ]:
             if col not in have:
                 conn.execute(f"ALTER TABLE listings ADD COLUMN {col} {decl}")
@@ -376,7 +377,7 @@ LISTING_FIELDS = (
     "body_style transmission drivetrain engine exterior_color interior_color "
     "mileage mileage_unit vin price currency listing_type auction_ends_at "
     "seller_type seller_name seller_city seller_state seller_zip status "
-    "listing_date data_source_note notes"
+    "listing_date data_source_note notes quarantine_reason"
 ).split()
 
 # Fields whose absence materially weakens a valuation.

@@ -383,12 +383,15 @@ def to_record(item: dict, cfg: dict, kind: str) -> dict:
 
 
 def is_911(rec: dict, item: dict, cfg: dict) -> bool:
+    from .. import model_guard as _guard
     make = str(_resolve(item, cfg, "make") or "")
     model = str(_resolve(item, cfg, "model") or "")
-    blob = f"{make} {model} {rec.get('title') or ''}".lower()
-    if "porsche" not in blob:
+    if "porsche" not in f"{make} {rec.get('title') or ''}".lower():
         return False
-    return "911" in blob or bool(rec.get("variant"))
+    # Only a confirmed 911 (by structured model/title/variant) is admitted.
+    verdict, _reason = _guard.classify_911(
+        title=rec.get("title"), model=model, variant=rec.get("variant"))
+    return verdict == _guard.VERDICT_CONFIRMED
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +448,7 @@ def ingest(conn, *, kind: str = "active", year_min: int | None = None,
             parsed = to_record(item, cfg, kind)
             rec = parsed["record"]
             if porsche_only and not is_911(rec, item, cfg):
+                res.rejected += 1
                 continue
             if not rec["url"]:
                 skipped_no_url += 1

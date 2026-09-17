@@ -100,7 +100,8 @@ CREATE TABLE IF NOT EXISTS listings (
     cosmetic_condition TEXT,             -- free text, operator-entered
     ppi_done          TEXT,              -- yes | no                 (NULL = unknown)
     seller_docs       TEXT,              -- yes | no                 (NULL = unknown)
-    original_status   TEXT               -- original | modified     (NULL = unknown)
+    original_status   TEXT,              -- original | modified     (NULL = unknown)
+    quarantine_reason TEXT               -- why a row is status='quarantined' (audit trail)
 );
 CREATE INDEX IF NOT EXISTS idx_listings_gen ON listings(generation, status);
 CREATE INDEX IF NOT EXISTS idx_listings_vin ON listings(vin);

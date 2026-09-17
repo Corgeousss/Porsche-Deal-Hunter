@@ -93,13 +93,17 @@ def cmd_enable(args):
 # ---------------------------------------------------------------------------
 def cmd_add(args):
     conn = _conn(args)
-    lid, created, report = _manual.add_listing(
-        conn, args.url, title=args.title, year=args.year, generation=args.generation,
-        variant=args.variant, body_style=args.body, transmission=args.transmission,
-        mileage=args.mileage, vin=args.vin, price=args.price,
-        seller_type=args.seller_type, seller_city=args.city, seller_state=args.state,
-        seller_zip=args.zip, listing_type=args.listing_type, notes=args.notes,
-        photos=args.photo or [], decode_vin=not args.no_vin_decode)
+    try:
+        lid, created, report = _manual.add_listing(
+            conn, args.url, title=args.title, year=args.year, generation=args.generation,
+            variant=args.variant, body_style=args.body, transmission=args.transmission,
+            mileage=args.mileage, vin=args.vin, price=args.price,
+            seller_type=args.seller_type, seller_city=args.city, seller_state=args.state,
+            seller_zip=args.zip, listing_type=args.listing_type, notes=args.notes,
+            photos=args.photo or [], decode_vin=not args.no_vin_decode)
+    except _manual.NotA911 as exc:
+        print(f"rejected: {exc}", file=sys.stderr)
+        return 1
     print(f"{'Added' if created else 'Updated'} listing #{lid} (source: {report['source_key']})")
     for n in report.get("notices", []):
         print(f"  ! {n}")
@@ -140,7 +144,9 @@ def cmd_fetch(args):
         return 1
 
     _db.finish_run(conn, run_id, res.status, res.seen, res.new, res.updated, res.message)
-    print(f"{source}: seen={res.seen} new={res.new} updated={res.updated} status={res.status}")
+    print(f"{source}: seen={res.seen} new={res.new} updated={res.updated} "
+          f"rejected_non_911={res.rejected} quarantined={res.quarantined} "
+          f"status={res.status}")
     if res.message:
         print(res.message.strip())
     return 0 if res.status != "error" else 1
@@ -615,6 +621,21 @@ def cmd_recon(args):
     return 0
 
 
+def cmd_audit_models(args):
+    from . import model_guard as _guard
+    conn = _conn(args)
+    res = _guard.audit_db(conn, apply=not args.dry_run)
+    verb = "would quarantine" if args.dry_run else "quarantined"
+    print(f"Audited {res['checked']} active listing(s). {verb} {res['quarantined']} "
+          f"non-911 ({res['rejected_model']} confirmed non-911 models, "
+          f"{res['uncertain']} unconfirmable).")
+    for f in res["flagged"]:
+        print(f"  #{f['id']} [{f['verdict']}] {f['title'] or '(no title)'} -- {f['reason']}")
+    if not res["flagged"]:
+        print("  All active listings are confirmed Porsche 911s.")
+    return 0
+
+
 def cmd_serve(args):
     from . import dashboard
     dashboard.serve(args.db, host=args.host, port=args.port,
@@ -789,6 +810,11 @@ def build_parser():
 
     ss = sub.add_parser("searches", help="list saved searches")
     ss.set_defaults(func=cmd_searches)
+
+    am = sub.add_parser("audit-models",
+                        help="re-verify every active listing is a 911; quarantine non-911s")
+    am.add_argument("--dry-run", action="store_true", help="report only, change nothing")
+    am.set_defaults(func=cmd_audit_models)
 
     rc = sub.add_parser("recon", help="record/show reconditioning cost estimates for a car")
     rc.add_argument("listing_id", type=int)
