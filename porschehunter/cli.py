@@ -112,11 +112,13 @@ def cmd_fetch(args):
     run_id = _db.start_run(conn, source)
     try:
         if source == "dealer_jsonld":
+            only_911 = not args.all_models
             if args.domain:
                 res = _jsonld.ingest_domain(conn, args.domain,
-                                            max_pages=args.max_pages)
+                                            max_pages=args.max_pages,
+                                            only_911=only_911)
             else:
-                res = _jsonld.ingest(conn, args.url or [])
+                res = _jsonld.ingest(conn, args.url or [], only_911=only_911)
         elif source == "craigslist_rss":
             res = _rss.ingest(conn)
         elif source == "marketcheck":
@@ -596,6 +598,9 @@ def build_parser():
                         "domain's sitemap (robots.txt enforced, rate limited)")
     f.add_argument("--max-pages", type=int, default=40,
                    help="dealer_jsonld --domain: cap on pages fetched")
+    f.add_argument("--all-models", action="store_true",
+                   help="dealer_jsonld: ingest every Porsche, not just 911s "
+                        "(default: 911s only, since this is a 911 tool)")
     f.add_argument("--kind", default="active", choices=list(_marketcheck.KINDS),
                    help="marketcheck: active=dealer, fsbo=private party, "
                         "auction=auction inventory")

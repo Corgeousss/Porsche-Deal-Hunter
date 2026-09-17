@@ -54,6 +54,17 @@ def domain_allowed(url: str, allowlist: set[str] | None = None) -> bool:
     return any(host == d or host.endswith("." + d) for d in allowlist)
 
 
+# Some dealer platforms emit `"image": "[\"a.jpg\",\"b.jpg\"]"` -- a JSON array
+# serialised as a string, but with the inner quotes left unescaped, which makes
+# the whole block invalid JSON. This narrowly unwraps that one broken shape so
+# the vehicle is not lost. URLs never contain `]`, so the non-greedy match is safe.
+_STRINGIFIED_ARRAY_RE = re.compile(r'("image"\s*:\s*)"(\[.*?\])"', re.DOTALL)
+
+
+def _repair_jsonld(text: str) -> str:
+    return _STRINGIFIED_ARRAY_RE.sub(r"\1\2", text)
+
+
 def extract_jsonld(page_html: str) -> list[dict]:
     """Return every JSON-LD object found in the page, flattened."""
     objects: list[dict] = []
@@ -62,7 +73,10 @@ def extract_jsonld(page_html: str) -> list[dict]:
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
-            continue
+            try:
+                data = json.loads(_repair_jsonld(text))
+            except json.JSONDecodeError:
+                continue
         stack = [data]
         while stack:
             item = stack.pop()
@@ -91,15 +105,49 @@ def _num(value) -> float | None:
     return float(m.group(0).replace(",", "")) if m else None
 
 
-def parse_vehicle(objects: list[dict], url: str) -> dict | None:
-    """Map a schema.org Vehicle/Car object onto our listing fields."""
-    vehicle = next(
-        (o for o in objects if any(t in ("Vehicle", "Car", "Product") for t in _type_of(o))),
-        None,
-    )
-    if vehicle is None:
-        return None
+_VEHICLE_TYPES = ("Vehicle", "Car", "Product")
+_TYPE_RANK = {"Vehicle": 0, "Car": 1, "Product": 2}
 
+
+def parse_vehicle(objects: list[dict], url: str) -> dict | None:
+    """Map schema.org Vehicle/Car/Product objects onto our listing fields.
+
+    Real dealer pages routinely split one car across several JSON-LD objects:
+    a `Product` carrying the price, a `Car`, and a `Vehicle` carrying the VIN,
+    mileage and body style, with the seller address complete in only one of
+    them. Picking the first match alone silently drops fields, so we parse every
+    candidate and merge them, letting the richer type (Vehicle > Car > Product)
+    win each field.
+    """
+    candidates = [o for o in objects
+                  if any(t in _VEHICLE_TYPES for t in _type_of(o))]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda o: min(
+        (_TYPE_RANK.get(t, 3) for t in _type_of(o)), default=3))
+
+    parts = [_extract_one(o, url) for o in candidates]
+    record: dict = {}
+    for p in parts:
+        for k, v in p["record"].items():
+            if record.get(k) in (None, "", []) and v not in (None, "", []):
+                record[k] = v
+
+    photos: list[str] = next((p["photos"] for p in parts if p["photos"]), [])
+    brand = next((p["brand"] for p in parts if p.get("brand")), None)
+    gen, ambiguous = _gens.from_year(record.get("year"))
+    record["generation"] = gen
+    return {
+        "record": record,
+        "photos": photos,
+        "brand": brand,
+        "ambiguous_generation": ambiguous,
+        "raw": parts[0]["raw"],
+    }
+
+
+def _extract_one(vehicle: dict, url: str) -> dict:
+    """Map a single schema.org Vehicle/Car/Product object onto listing fields."""
     offer = vehicle.get("offers")
     if isinstance(offer, list):
         offer = offer[0] if offer else None
@@ -110,7 +158,9 @@ def parse_vehicle(objects: list[dict], url: str) -> dict | None:
         brand = brand.get("name")
     name = vehicle.get("name") or ""
 
-    year = _num(vehicle.get("modelDate") or vehicle.get("productionDate") or vehicle.get("vehicleModelDate"))
+    year = _num(vehicle.get("modelDate") or vehicle.get("productionDate")
+                or vehicle.get("vehicleModelDate") or vehicle.get("year")
+                or vehicle.get("releaseDate"))
     year = int(year) if year else _gens.parse_year(name)
 
     model = vehicle.get("model")
@@ -139,11 +189,15 @@ def parse_vehicle(objects: list[dict], url: str) -> dict | None:
     images = [i.get("url") if isinstance(i, dict) else i for i in images]
     images = [i for i in images if isinstance(i, str)]
 
+    listing_url = offer.get("url") or vehicle.get("url") or url
+    if isinstance(listing_url, str) and not listing_url.lower().startswith("http"):
+        listing_url = urllib.parse.urljoin(url, listing_url)
+
     gen, ambiguous = _gens.from_year(year)
     return {
         "record": {
             "source_key": "dealer_jsonld",
-            "url": offer.get("url") or vehicle.get("url") or url,
+            "url": listing_url,
             "title": name or descriptor.strip() or None,
             "year": year,
             "generation": gen,
@@ -156,7 +210,9 @@ def parse_vehicle(objects: list[dict], url: str) -> dict | None:
             "exterior_color": vehicle.get("color"),
             "interior_color": vehicle.get("vehicleInteriorColor"),
             "mileage": int(mileage) if mileage else None,
-            "vin": _vin.normalize(vehicle.get("vehicleIdentificationNumber")),
+            "vin": _vin.normalize(vehicle.get("vehicleIdentificationNumber")
+                                  or vehicle.get("serialNumber")
+                                  or vehicle.get("mpn")),
             "price": _num(offer.get("price")),
             "currency": offer.get("priceCurrency") or "USD",
             "listing_type": "fixed",
@@ -174,7 +230,24 @@ def parse_vehicle(objects: list[dict], url: str) -> dict | None:
     }
 
 
-def ingest_url(conn, url: str, *, require_porsche: bool = True) -> tuple[int | None, bool, dict]:
+# Tokens unique to the 911 line. "Carrera"/"Targa" never appear on a Macan,
+# Cayenne, Panamera, Boxster or Cayman, so they safely identify a 911. "911"
+# must be matched with digit boundaries -- dealer stock numbers embedded in a
+# URL (e.g. ".../id-65391149") contain "911" as a coincidental digit run and
+# must NOT be read as the model.
+_NINE11_RE = re.compile(r"(?<!\d)911(?!\d)|carrera|targa", re.IGNORECASE)
+
+
+def is_911(text: str | None) -> bool:
+    return bool(_NINE11_RE.search(text or ""))
+
+
+def looks_like_911_url(url: str) -> bool:
+    return is_911(url)
+
+
+def ingest_url(conn, url: str, *, require_porsche: bool = True,
+               only_911: bool = False) -> tuple[int | None, bool, dict]:
     report: dict = {"notices": []}
     if not domain_allowed(url):
         raise http_util.NotAllowed(
@@ -197,6 +270,10 @@ def ingest_url(conn, url: str, *, require_porsche: bool = True) -> tuple[int | N
     brand = (parsed.get("brand") or "") + " " + (rec.get("title") or "")
     if require_porsche and "porsche" not in brand.lower():
         return None, False, {"notices": [f"Skipped: not a Porsche ({brand.strip() or 'unknown'})."]}
+    if only_911 and not (is_911(rec.get("title")) or is_911(rec.get("variant"))
+                         or is_911(url)):
+        return None, False, {"notices": [
+            f"Skipped: not a 911 ({rec.get('title') or 'unknown model'})."]}
     if parsed["ambiguous_generation"]:
         report["notices"].append(
             f"Model year {rec['year']} spans two generations; '{rec['generation']}' assumed."
@@ -212,11 +289,11 @@ def ingest_url(conn, url: str, *, require_porsche: bool = True) -> tuple[int | N
     return listing_id, created, report
 
 
-def ingest(conn, urls: list[str]) -> IngestResult:
+def ingest(conn, urls: list[str], *, only_911: bool = False) -> IngestResult:
     res = IngestResult(source_key="dealer_jsonld")
     for u in urls:
         try:
-            lid, created, rep = ingest_url(conn, u)
+            lid, created, rep = ingest_url(conn, u, only_911=only_911)
         except (http_util.NotAllowed, ValueError, OSError) as exc:
             res.status = "error"
             res.message += f"{u}: {type(exc).__name__}: {exc}\n"
@@ -347,11 +424,14 @@ def discover_urls(domain: str, max_sitemaps: int = 8,
 
 
 def ingest_domain(conn, domain: str, max_pages: int = 40,
-                  max_urls: int = 500) -> IngestResult:
+                  max_urls: int = 500, only_911: bool = True) -> IngestResult:
     """Discover and ingest Porsche 911 listings from one allowlisted domain.
 
     Every request obeys robots.txt and the per-host rate limit. Pages without
-    schema.org JSON-LD are skipped, never scraped.
+    schema.org JSON-LD are skipped, never scraped. When ``only_911`` (the
+    default, since this is a 911 tool), candidate URLs are pre-filtered to the
+    911 line so the per-host rate limit is not spent fetching Macans and
+    Cayennes; a non-911 that slips through the URL filter is dropped after parse.
     """
     res = IngestResult(source_key="dealer_jsonld")
     try:
@@ -361,6 +441,16 @@ def ingest_domain(conn, domain: str, max_pages: int = 40,
         res.message = str(exc)
         return res
     res.message = "\n".join(notes) + "\n"
+
+    if only_911 and candidates:
+        before = len(candidates)
+        filtered = [u for u in candidates if looks_like_911_url(u)]
+        # Only narrow when the URLs actually name their model; if none match,
+        # the site uses opaque URLs and we fall back to parse-time filtering.
+        if filtered:
+            candidates = filtered
+            res.message += (f"911 URL filter: {len(candidates)} of {before} "
+                            f"candidate URLs name a 911\n")
 
     if not candidates:
         res.status = "skipped"
@@ -378,7 +468,7 @@ def ingest_domain(conn, domain: str, max_pages: int = 40,
             break
         fetched += 1
         try:
-            listing_id, created, _rep = ingest_url(conn, url)
+            listing_id, created, _rep = ingest_url(conn, url, only_911=only_911)
         except http_util.NotAllowed as exc:
             res.message += f"{url}: {exc}\n"
             continue

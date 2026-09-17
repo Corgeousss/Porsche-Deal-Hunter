@@ -636,6 +636,79 @@ class TestJsonLd(unittest.TestCase):
     def test_no_jsonld_returns_nothing(self):
         self.assertEqual(jsonld.extract_jsonld("<html><body>a car</body></html>"), [])
 
+    # A real dealer page (DealerFire/CDK platform) splits one car across a
+    # Product object that has the price but no VIN or mileage, and a Vehicle
+    # object that has the VIN, mileage and body but only a partial address.
+    # The parser must merge them, not take the first match and drop fields.
+    SPLIT = """<html><head>
+    <script type="application/ld+json">
+    {"@context":"https://schema.org","@type":"Product",
+     "name":"2021 Porsche 911 Carrera","brand":{"@type":"Brand","name":"Porsche"},
+     "vehicleModelDate":"2021","mpn":"WP0AA2A90MS205791",
+     "offers":{"@type":"Offer","price":125959,"priceCurrency":"USD",
+       "availability":"https://schema.org/InStock",
+       "seller":{"@type":"AutoDealer","name":"Champion Porsche",
+         "address":{"addressLocality":"Pompano Beach","addressRegion":"FL","postalCode":"33064"}}}}
+    </script>
+    <script type="application/ld+json">
+    {"@context":"https://schema.org","@type":"Vehicle","name":"2021 Porsche 911 Carrera",
+     "brand":{"@type":"Brand","name":"Porsche"},"year":2021,"bodyType":"Coupe",
+     "vehicleTransmission":"Automatic","vehicleIdentificationNumber":"WP0AA2A90MS205791",
+     "mileageFromOdometer":{"@type":"QuantitativeValue","value":31900,"unitCode":"SMI"},
+     "offers":{"@type":"Offer","price":125959,"priceCurrency":"USD",
+       "seller":{"@type":"AutoDealer","name":"Champion Porsche"}}}
+    </script></head></html>"""
+
+    def test_merges_split_product_and_vehicle_objects(self):
+        rec = jsonld.parse_vehicle(
+            jsonld.extract_jsonld(self.SPLIT),
+            "https://d.invalid/vehicle-details-used-2021-porsche-911-carrera-id-1")["record"]
+        # from the Vehicle object
+        self.assertEqual(rec["vin"], "WP0AA2A90MS205791")
+        self.assertEqual(rec["mileage"], 31900)
+        self.assertEqual(rec["year"], 2021)
+        self.assertEqual(rec["generation"], "992.1")
+        # from whichever object had it; price present, location complete
+        self.assertEqual(rec["price"], 125959.0)
+        self.assertEqual(rec["seller_city"], "Pompano Beach")
+        self.assertEqual(rec["seller_state"], "FL")
+
+    def test_vin_falls_back_to_serial_or_mpn(self):
+        objs = [{"@type": "Product", "name": "2021 Porsche 911 Carrera",
+                 "mpn": "WP0AA2A90MS205791", "brand": {"name": "Porsche"}}]
+        rec = jsonld.parse_vehicle(objs, "https://d.invalid/x")["record"]
+        self.assertEqual(rec["vin"], "WP0AA2A90MS205791")
+
+    # Some platforms emit `"image": "[...]"` -- an array serialised as a string
+    # with the inner quotes unescaped, which is invalid JSON. The whole block
+    # must not be lost.
+    BROKEN_IMAGE = ('<html><head><script type="application/ld+json">'
+                    '{"@context":"https://schema.org","@type":"Car",'
+                    '"name":"1985 Porsche 911 Carrera","brand":{"name":"Porsche"},'
+                    '"modelDate":"1985",'
+                    '"image":"[\"https://x.invalid/a.jpg\",\"https://x.invalid/b.jpg\"]",'
+                    '"offers":{"@type":"Offer","price":"89500","priceCurrency":"USD"}}'
+                    '</script></head></html>')
+
+    def test_repairs_stringified_image_array(self):
+        objs = jsonld.extract_jsonld(self.BROKEN_IMAGE)
+        self.assertTrue(objs, "block with malformed image array should still parse")
+        parsed = jsonld.parse_vehicle(objs, "https://d.invalid/x")
+        self.assertEqual(parsed["record"]["price"], 89500.0)
+        self.assertEqual(len(parsed["photos"]), 2)
+
+    def test_only_911_filter_recognises_the_line(self):
+        self.assertTrue(jsonld.is_911("2015 Porsche 911 Carrera S"))
+        self.assertTrue(jsonld.is_911("Porsche 993 Targa"))
+        self.assertTrue(jsonld.looks_like_911_url(
+            "https://d.invalid/used-2016-porsche-911-carrera-id-9"))
+        self.assertFalse(jsonld.is_911("2019 Porsche Macan S"))
+        self.assertFalse(jsonld.is_911("2020 Porsche Cayenne Turbo"))
+        # A dealer stock number that merely contains the digits 911 is not a 911.
+        self.assertFalse(jsonld.looks_like_911_url(
+            "https://d.invalid/vehicle-details-new-2026-porsche-macan--id-65391149"))
+        self.assertFalse(jsonld.is_911("id-65391149"))
+
     def test_domain_allowlist_blocks_by_default(self):
         self.assertFalse(jsonld.domain_allowed("https://example.invalid/x", allowlist=set()))
         self.assertTrue(jsonld.domain_allowed("https://www.example.invalid/x",
