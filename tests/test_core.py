@@ -93,6 +93,11 @@ class TestGenerations(unittest.TestCase):
         self.assertEqual(generations.normalize_variant(
             "2021 911 Carrera S with turbocharged engine"), "Carrera S")
 
+    def test_targa_is_not_mislabelled_carrera(self):
+        # "Targa 4S" must not match the bare "4s" needle of Carrera 4S.
+        self.assertEqual(generations.normalize_variant("2022 Porsche 911 Targa 4S"), "Targa 4S")
+        self.assertEqual(generations.normalize_variant("2024 Porsche 911 Targa 4"), "Targa 4")
+
     def test_transmission(self):
         self.assertEqual(generations.normalize_transmission("7-Speed PDK"), "pdk")
         self.assertEqual(generations.normalize_transmission("Tiptronic S"), "tiptronic")

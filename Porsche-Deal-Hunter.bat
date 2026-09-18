@@ -63,12 +63,14 @@ goto menu
 
 :dashboard
 echo.
-echo Opening http://127.0.0.1:8000 in your browser...
+echo Starting the dashboard server, then opening http://127.0.0.1:8000 ...
 echo The dashboard defaults to 911s under $100,000. Use the left-hand filters
 echo to change price, generation, variant, mileage and more; Save search to
 echo store a search and turn on alerts; the bell shows notifications.
 echo When you are finished, click back in THIS window and press Ctrl+C.
-start "" "http://127.0.0.1:8000"
+REM Open the browser a few seconds AFTER the server is up (a detached waiter),
+REM so the first page load does not hit a not-yet-listening port.
+start "" cmd /c "timeout /t 3 /nobreak >nul & start "" http://127.0.0.1:8000"
 python -m porschehunter serve --destination %DEST%
 goto menu
 

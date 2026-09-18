@@ -184,8 +184,12 @@ def _extract_one(vehicle: dict, url: str) -> dict:
     model = vehicle.get("model")
     if isinstance(model, dict):
         model = model.get("name")
+    # Variant/body/transmission are read from the title and structured spec
+    # fields only -- NOT the marketing description, which routinely mentions
+    # other trims ("rivals the Turbo", "$15,980 in options", "turbocharged")
+    # and would mislabel the car (e.g. a Carrera tagged Turbo).
     descriptor = " ".join(str(x) for x in (name, model, vehicle.get("vehicleConfiguration"),
-                                           vehicle.get("trim"), vehicle.get("description"))
+                                           vehicle.get("trim"))
                           if x)
 
     mileage = _num((vehicle.get("mileageFromOdometer") or {}) if isinstance(
