@@ -63,15 +63,27 @@ goto menu
 
 :dashboard
 echo.
-echo Starting the dashboard server, then opening http://127.0.0.1:8000 ...
-echo The dashboard defaults to 911s under $100,000. Use the left-hand filters
-echo to change price, generation, variant, mileage and more; Save search to
-echo store a search and turn on alerts; the bell shows notifications.
-echo When you are finished, click back in THIS window and press Ctrl+C.
-REM Open the browser a few seconds AFTER the server is up (a detached waiter),
-REM so the first page load does not hit a not-yet-listening port.
-start "" cmd /c "timeout /t 3 /nobreak >nul & start "" http://127.0.0.1:8000"
-python -m porschehunter serve --destination %DEST%
+echo Starting the dashboard in its own window (it will keep running
+echo independently, even after you close this menu)...
+REM If it is already up, just open the browser.
+powershell -NoProfile -Command "try{(Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/ -TimeoutSec 2)^|Out-Null; exit 0}catch{exit 1}" >nul 2>nul
+if not errorlevel 1 (
+  start "" http://127.0.0.1:8000
+  echo Dashboard already running -- opened http://127.0.0.1:8000
+  echo.
+  pause
+  goto menu
+)
+start "Porsche Deal Hunter Server (keep this window open)" /D "%~dp0" cmd /k "set PORSCHE_DB=data\real.db& python -m porschehunter serve --destination %DEST%"
+powershell -NoProfile -Command "for($i=0;$i -lt 40;$i++){ try{ (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8000/ -TimeoutSec 2)^|Out-Null; exit 0 }catch{ Start-Sleep -Milliseconds 750 } }; exit 1"
+if errorlevel 1 (
+  echo Server did not respond -- check the "Porsche Deal Hunter Server" window.
+) else (
+  start "" http://127.0.0.1:8000
+  echo Dashboard is running at http://127.0.0.1:8000 in its own window.
+)
+echo.
+pause
 goto menu
 
 :listings
